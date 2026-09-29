@@ -1,3 +1,4 @@
+import { adoptPiProcessIdentity } from "./process-identity.mjs";
 import { loadExtension } from "./runtime.mjs";
 
 const entry = process.argv[2];
@@ -6,6 +7,7 @@ if (!entry) {
   process.exit(1);
 }
 
+adoptPiProcessIdentity();
 try {
   await loadExtension(entry);
 } catch (err) {

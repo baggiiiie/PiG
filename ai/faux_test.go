@@ -124,8 +124,8 @@ func TestFauxProvider_NoResponsesQueued(t *testing.T) {
 
 func TestFauxProvider_Factory(t *testing.T) {
 	provider := NewFauxProvider(FauxConfig{})
-	provider.SetResponses([]FauxResponseStep{FauxFactoryStep(func(_ TranscriptContext, _ StreamOptions, _ int) FauxResponse {
-		return FauxResponse{Content: []FauxContentBlock{FauxText("dynamic response")}, StopReason: "stop"}
+	provider.SetResponses([]FauxResponseStep{FauxFactoryStep(func(_ TranscriptContext, _ StreamOptions, _ *FauxProviderState, _ *Model) (FauxResponse, error) {
+		return FauxResponse{Content: []FauxContentBlock{FauxText("dynamic response")}, StopReason: "stop"}, nil
 	})})
 	stream, err := provider.Stream(context.Background(), emptyTranscript(), StreamOptions{})
 	if err != nil {

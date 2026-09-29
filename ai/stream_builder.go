@@ -18,7 +18,8 @@ type assistantStreamBuilder struct {
 	toolCalls      map[int]*streamToolCall
 
 	// modelCost is the requested model's price (StreamOptions.ModelCost).
-	modelCost ModelCost
+	modelCost          ModelCost
+	requestServiceTier string
 }
 
 type streamToolCall struct {
@@ -31,6 +32,7 @@ type streamToolCallDelta struct {
 	id               string
 	name             string
 	argumentsDelta   string
+	initialArguments JsonObject
 	thoughtSignature string
 	namespace        string
 }
@@ -65,9 +67,13 @@ func (builder *assistantStreamBuilder) start() {
 }
 
 func (builder *assistantStreamBuilder) textBlockStart() int {
+	return builder.textBlockStartWithContent("")
+}
+
+func (builder *assistantStreamBuilder) textBlockStartWithContent(content string) int {
 	builder.start()
 	contentIndex := len(builder.partial.Content)
-	builder.partial.Content = append(builder.partial.Content, TextContent{})
+	builder.partial.Content = append(builder.partial.Content, TextContent{Text: content})
 	builder.push(TextStartEvent{ContentIndex: contentIndex, Partial: builder.partial})
 	return contentIndex
 }
@@ -88,9 +94,13 @@ func (builder *assistantStreamBuilder) textBlockEnd(contentIndex int, content, s
 }
 
 func (builder *assistantStreamBuilder) thinkingBlockStart() int {
+	return builder.thinkingBlockStartWithContent(ThinkingContent{})
+}
+
+func (builder *assistantStreamBuilder) thinkingBlockStartWithContent(content ThinkingContent) int {
 	builder.start()
 	contentIndex := len(builder.partial.Content)
-	builder.partial.Content = append(builder.partial.Content, ThinkingContent{})
+	builder.partial.Content = append(builder.partial.Content, content)
 	builder.push(ThinkingStartEvent{ContentIndex: contentIndex, Partial: builder.partial})
 	return contentIndex
 }
@@ -105,6 +115,7 @@ func (builder *assistantStreamBuilder) thinkingBlockDelta(contentIndex int, delt
 func (builder *assistantStreamBuilder) thinkingBlockSignature(contentIndex int, signature string) {
 	block := builder.partial.Content[contentIndex].(ThinkingContent)
 	block.ThinkingSignature = signature
+	block.thinkingSignatureEmpty = signature == ""
 	builder.partial.Content[contentIndex] = block
 }
 
@@ -112,23 +123,26 @@ func (builder *assistantStreamBuilder) thinkingBlockEnd(contentIndex int, conten
 	block := builder.partial.Content[contentIndex].(ThinkingContent)
 	block.Thinking = content
 	block.ThinkingSignature = signature
+	if signature != "" {
+		block.thinkingSignatureEmpty = false
+	}
 	builder.partial.Content[contentIndex] = block
 	builder.push(ThinkingEndEvent{ContentIndex: contentIndex, Content: content, Partial: builder.partial})
 }
 
-func (builder *assistantStreamBuilder) textStart() {
+func (builder *assistantStreamBuilder) textStart(content string) {
 	builder.start()
 	builder.endThinking()
 	if builder.activeText >= 0 {
 		return
 	}
 	builder.activeText = len(builder.partial.Content)
-	builder.partial.Content = append(builder.partial.Content, TextContent{})
+	builder.partial.Content = append(builder.partial.Content, TextContent{Text: content})
 	builder.push(TextStartEvent{ContentIndex: builder.activeText, Partial: builder.partial})
 }
 
 func (builder *assistantStreamBuilder) textDelta(delta string) {
-	builder.textStart()
+	builder.textStart("")
 	block := builder.partial.Content[builder.activeText].(TextContent)
 	block.Text += delta
 	builder.partial.Content[builder.activeText] = block
@@ -144,21 +158,19 @@ func (builder *assistantStreamBuilder) textSignature(signature string) {
 	builder.partial.Content[builder.activeText] = block
 }
 
-func (builder *assistantStreamBuilder) thinkingStart(redacted bool, content, signature string) {
+func (builder *assistantStreamBuilder) thinkingStart(content ThinkingContent) {
 	builder.start()
 	builder.endText()
 	if builder.activeThinking >= 0 {
 		return
 	}
 	builder.activeThinking = len(builder.partial.Content)
-	builder.partial.Content = append(builder.partial.Content, ThinkingContent{
-		Thinking: content, ThinkingSignature: signature, Redacted: redacted,
-	})
+	builder.partial.Content = append(builder.partial.Content, content)
 	builder.push(ThinkingStartEvent{ContentIndex: builder.activeThinking, Partial: builder.partial})
 }
 
 func (builder *assistantStreamBuilder) thinkingDelta(delta string, redacted bool) {
-	builder.thinkingStart(redacted, "", "")
+	builder.thinkingStart(ThinkingContent{Redacted: redacted})
 	block := builder.partial.Content[builder.activeThinking].(ThinkingContent)
 	block.Thinking += delta
 	block.Redacted = block.Redacted || redacted
@@ -172,6 +184,7 @@ func (builder *assistantStreamBuilder) thinkingSignature(signature string) {
 	}
 	block := builder.partial.Content[builder.activeThinking].(ThinkingContent)
 	block.ThinkingSignature = signature
+	block.thinkingSignatureEmpty = signature == ""
 	builder.partial.Content[builder.activeThinking] = block
 }
 
@@ -184,8 +197,12 @@ func (builder *assistantStreamBuilder) toolCallStart(delta streamToolCallDelta) 
 	}
 	state := &streamToolCall{contentIndex: len(builder.partial.Content)}
 	builder.toolCalls[delta.index] = state
+	arguments := delta.initialArguments
+	if arguments == nil {
+		arguments = JsonObject{}
+	}
 	builder.partial.Content = append(builder.partial.Content, ToolCall{
-		ID: delta.id, Name: delta.name, Arguments: JsonObject{}, Namespace: delta.namespace,
+		ID: delta.id, Name: delta.name, Arguments: arguments, Namespace: delta.namespace,
 	})
 	builder.push(ToolCallStartEvent{ContentIndex: state.contentIndex, Partial: builder.partial})
 }
@@ -207,6 +224,7 @@ func (builder *assistantStreamBuilder) toolCallDelta(delta streamToolCallDelta) 
 		block.Namespace = delta.namespace
 	}
 	state.arguments.WriteString(delta.argumentsDelta)
+	block.Arguments = parseStreamingJsonObject(state.arguments.String())
 	builder.partial.Content[state.contentIndex] = block
 	builder.push(ToolCallDeltaEvent{ContentIndex: state.contentIndex, Delta: delta.argumentsDelta, Partial: builder.partial})
 }
@@ -343,6 +361,7 @@ func (builder *assistantStreamBuilder) push(event AssistantMessageEvent) {
 	}
 }
 
+// pig divergence (D82): nonterminal partials are owned snapshots, without live revisions or provider parser scratch fields.
 func snapshotAssistantEvent(event AssistantMessageEvent) AssistantMessageEvent {
 	snapshot := func(message *AssistantMessage) *AssistantMessage {
 		if message == nil {

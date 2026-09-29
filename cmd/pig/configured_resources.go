@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -14,6 +16,7 @@ import (
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
 	"github.com/MichaelKinsy/PiG/coding/packagecontent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 )
 
 func configuredExtensionResolver(resolvers []extsource.ResolveFunc) extsource.ResolveFunc {
@@ -28,17 +31,16 @@ func collectStartupThemePaths(cwd, agentDir string, sm *codingagent.SettingsMana
 	paths := collectTopLevelResourcePaths(filepath.Join(agentDir, "themes"), global.Themes, "themes")
 	for _, pkg := range global.Packages {
 		root := installedPathForConfiguredSource(cwd, sm, pkg.Source, false)
-		if root == "" {
+		if configuredPackageNeedsInstall(configuredPackage{Source: pkg, InstalledPath: root}) {
 			continue
 		}
-		resources, err := packagecontent.Discover(root)
+		items, err := collectPackageResourceItems(root, configuredPackage{Source: pkg, Scope: "user", InstalledPath: root}, false)
 		if err != nil {
 			continue
 		}
-		for _, source := range resources.ThemeFiles {
-			rel, _ := filepath.Rel(root, source)
-			if packagecontent.ResourceEnabled(rel, pkg.Themes) {
-				paths = append(paths, source)
+		for _, item := range items {
+			if item.ResourceType == "themes" && item.Enabled {
+				paths = append(paths, item.Path)
 			}
 		}
 	}
@@ -73,7 +75,7 @@ func collectPromptPaths(cwd, agentDir string, sm *codingagent.SettingsManager, f
 func collectThemePaths(cwd, agentDir string, sm *codingagent.SettingsManager, flags CLIFlags, projectTrusted bool, resolvers ...extsource.ResolveFunc) []string {
 	paths := make([]string, 0)
 	for _, p := range flags.Themes {
-		paths = append(paths, collectResourceFilesFromPaths([]string{resolveSettingsPath(cwd, p)}, "themes")...)
+		paths = append(paths, resolveSettingsPath(cwd, p))
 	}
 	if !flags.NoThemes {
 		if projectRoot, ok := projectResourceRoot(cwd); projectTrusted && ok {
@@ -85,18 +87,38 @@ func collectThemePaths(cwd, agentDir string, sm *codingagent.SettingsManager, fl
 	return dedupStrings(paths)
 }
 
+// packageManagerHomeDir prefers nonempty HOME on every platform. Otherwise it uses the platform home variable, including an explicit empty value, or the OS user database when that variable is absent.
+// Ports packages/coding-agent/src/core/package-manager.ts:getHomeDir.
+func packageManagerHomeDir() string {
+	if home := os.Getenv("HOME"); home != "" {
+		return home
+	}
+	key := "HOME"
+	if runtime.GOOS == "windows" {
+		key = "USERPROFILE"
+	}
+	if home, present := os.LookupEnv(key); present {
+		return home
+	}
+	if current, err := user.Current(); err == nil {
+		return current.HomeDir
+	}
+	return ""
+}
+
+// collectSkillInputs appends --skill paths after resolved project, user, and Package skills, as DefaultResourceLoader.reload does. --no-skills keeps the explicit paths alone.
+// Ports packages/coding-agent/src/core/resource-loader.ts
 func collectSkillInputs(cwd, agentDir string, sm *codingagent.SettingsManager, flags CLIFlags, ambientScopes *[]string, resolvers ...extsource.ResolveFunc) []string {
-	inputs := make([]string, 0)
+	var cliInputs []string
 	for _, p := range flags.Skills {
-		inputs = append(inputs, collectResourceFilesFromPaths([]string{resolveSettingsPath(cwd, p)}, "skills")...)
+		cliInputs = append(cliInputs, collectResourceFilesFromPaths([]string{resolveSettingsPath(cwd, p)}, "skills")...)
 	}
 	if flags.NoSkills {
-		return dedupStrings(inputs)
+		return dedupStrings(cliInputs)
 	}
 
-	// Pi resolves same-name Skill collisions first-wins after ordering paths by
-	// precedence: CLI, project explicit, project auto, user explicit, user auto,
-	// then Package resources.
+	inputs := make([]string, 0)
+	// Resolved paths follow resourcePrecedenceRank; explicit --skill paths are additionalSkillPaths, not cliEnabledSkills from -e Packages.
 	projectRoot, projectResourcesEnabled := projectResourceRoot(cwd)
 	if ambientSourceEnabled(ambientScopes, "workspace") && projectResourcesEnabled {
 		projectSettings := sm.GetProjectSettings().Skills
@@ -104,8 +126,7 @@ func collectSkillInputs(cwd, agentDir string, sm *codingagent.SettingsManager, f
 		projectAuto := collectAutoDiscoveredResourcePaths(filepath.Join(projectRoot, "skills"), "skills")
 		inputs = append(inputs, filterAutoDiscoveredPaths(projectAuto, projectSettings, projectRoot, "skills")...)
 
-		home, _ := os.UserHomeDir()
-		userAgentsSkills := filepath.Join(home, ".agents", "skills")
+		userAgentsSkills := filepath.Join(packageManagerHomeDir(), ".agents", "skills")
 		for _, dir := range discoverAncestorAgentsSkillDirs(cwd) {
 			abs, _ := filepath.Abs(dir)
 			uabs, _ := filepath.Abs(userAgentsSkills)
@@ -121,13 +142,12 @@ func collectSkillInputs(cwd, agentDir string, sm *codingagent.SettingsManager, f
 		inputs = append(inputs, resolveConfiguredResourceEntries(userSettings, agentDir, "skills")...)
 		userAuto := collectAutoDiscoveredResourcePaths(filepath.Join(agentDir, "skills"), "skills")
 		inputs = append(inputs, filterAutoDiscoveredPaths(userAuto, userSettings, agentDir, "skills")...)
-		home, _ := os.UserHomeDir()
-		userAgentsSkills := filepath.Join(home, ".agents", "skills")
+		userAgentsSkills := filepath.Join(packageManagerHomeDir(), ".agents", "skills")
 		inputs = append(inputs, filterAutoDiscoveredPaths(discoverSkillDir(userAgentsSkills), userSettings, filepath.Dir(userAgentsSkills), "skills")...)
 	}
 
 	inputs = append(inputs, collectPackageSkillPaths(cwd, sm, ambientScopes, resolvers...)...)
-	return dedupStrings(inputs)
+	return dedupStrings(append(inputs, cliInputs...))
 }
 
 func collectExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManager, flags CLIFlags, ambientScopes *[]string, resolvers ...extsource.ResolveFunc) []subprocess.ExtConfig {
@@ -139,7 +159,22 @@ func collectExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManag
 	configs := make([]subprocess.ExtConfig, 0)
 	var missing []subprocess.ExtConfig
 	for _, p := range flags.Extensions {
-		for _, config := range cliExtensionConfigs(resolveSettingsPath(cwd, p), resolvers...) {
+		resolved, err := resolveCLIExtensionSource(cwd, agentDir, sm, p, nil)
+		if err != nil {
+			missing = append(missing, subprocess.UnresolvedExtConfig(p, err))
+			continue
+		}
+		if resolved == "" {
+			continue
+		}
+		loaded := cliExtensionConfigs
+		if kind := detectSourceKind(p); kind == "git" || kind == "npm" {
+			// Pi package-manager.ts:1293-1307 collects an npm or git -e checkout only as a Package; unlike a local directory (:1346-1351), it never loads the checkout root itself.
+			loaded = func(root string, resolvers ...extsource.ResolveFunc) []subprocess.ExtConfig {
+				return withCLISourceInfo(packageExtensionConfigs(root, nil, resolvers...))
+			}
+		}
+		for _, config := range loaded(resolved, resolvers...) {
 			if _, absent := errors.AsType[extensionPathMissingError](config.ResolveError()); absent {
 				missing = append(missing, config)
 				continue
@@ -156,7 +191,35 @@ func collectExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManag
 		}
 		configs = append(configs, collectPackageExtensionConfigs(cwd, sm, ambientScopes, resolvers...)...)
 	}
-	return mergeExtConfigs(append(configs, missing...))
+	return mergeExtConfigs(uniqueExtensionPaths(append(configs, missing...)))
+}
+
+// uniqueExtensionPaths retains the first selected alias of each canonical extension source before any factory runs.
+func uniqueExtensionPaths(configs []subprocess.ExtConfig) []subprocess.ExtConfig {
+	type sourceKey struct{ path, module, pkg, factory string }
+	seen := make(map[sourceKey]struct{}, len(configs))
+	out := make([]subprocess.ExtConfig, 0, len(configs))
+	for _, config := range configs {
+		path := config.Source
+		if path == "" {
+			path = config.Path
+		}
+		if path == "" {
+			out = append(out, config)
+			continue
+		}
+		if absolute, err := filepath.Abs(path); err == nil {
+			path = absolute
+		}
+		// pig additive (D20): distinct native factories in one source module retain their separate registrations.
+		key := sourceKey{codingagent.CanonicalizePath(path), config.ModulePath, config.Package, config.Factory}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, config)
+	}
+	return out
 }
 
 // cliExtensionConfigs resolves one -e path. Like upstream resource-loader.ts,
@@ -211,7 +274,7 @@ func withCLISourceInfo(configs []subprocess.ExtConfig) []subprocess.ExtConfig {
 // one.
 func collectTopLevelExtensionConfigs(autoDir string, entries []string, scope string, resolvers ...extsource.ResolveFunc) []subprocess.ExtConfig {
 	baseDir := filepath.Dir(autoDir)
-	automatic := filterAutoDiscoveredPaths(collectAutoDiscoveredResourcePaths(autoDir, "extensions"), entries, autoDir, "extensions")
+	automatic := filterAutoDiscoveredPaths(collectAutoDiscoveredResourcePaths(autoDir, "extensions"), entries, baseDir, "extensions")
 	configs := make([]subprocess.ExtConfig, 0, len(automatic)+len(entries))
 	// Settings entries rank before auto-discovery in the same scope.
 	for _, path := range resolveConfiguredResourceEntries(entries, baseDir, "extensions") {
@@ -285,53 +348,30 @@ func configuredPackageFilters(source codingagent.PackageSource) map[packageconte
 
 func effectiveConfiguredPackageFilters(pkg configuredPackage, resolvers ...extsource.ResolveFunc) (map[packagecontent.Kind][]string, error) {
 	filters := configuredPackageFilters(pkg.Source)
-	if pkg.ProjectDelta == nil {
+	if !isProjectPackageDelta(pkg.Source) {
 		return filters, nil
 	}
-	inspectionFilters := map[packagecontent.Kind][]string{
-		packagecontent.Extensions: {},
-		packagecontent.Skills:     {},
-		packagecontent.Prompts:    {},
-		packagecontent.Themes:     {},
-	}
-	resources, missing, err := packagecontent.InspectConfiguredWithResolver(pkg.InstalledPath, inspectionFilters, configuredExtensionResolver(resolvers))
+	items, err := collectPackageResourceItems(pkg.InstalledPath, pkg, true, resolvers...)
 	if err != nil {
 		return nil, err
 	}
-	paths := map[packagecontent.Kind][]string{
-		packagecontent.Extensions: resources.ExtensionEntries,
-		packagecontent.Skills:     resources.SkillDirs,
-		packagecontent.Prompts:    resources.PromptFiles,
-		packagecontent.Themes:     resources.ThemeFiles,
+	for kind := range filters {
+		filters[kind] = []string{}
 	}
-	for kind, entries := range paths {
-		relativePaths := make([]string, 0, len(entries))
-		for _, resourcePath := range entries {
-			target := resourcePath
-			if kind == packagecontent.Skills {
-				target = filepath.Join(target, "SKILL.md")
-			}
-			relative, relErr := filepath.Rel(pkg.InstalledPath, target)
-			if relErr != nil {
-				return nil, relErr
-			}
-			relativePaths = append(relativePaths, filepath.ToSlash(relative))
+	for _, item := range items {
+		if !item.Enabled {
+			continue
 		}
-		for _, member := range missing {
-			if member.Kind == kind {
-				relativePaths = append(relativePaths, member.Pattern)
-			}
+		path := item.Path
+		if item.ResourceType == "skills" {
+			path = packagecontent.SkillFile(path)
 		}
-		effective, deltaErr := packagecontent.ApplyConfiguredDelta(
-			kind,
-			packagecontent.Deduplicate(relativePaths),
-			filters[kind],
-			configuredPackageFilters(*pkg.ProjectDelta)[kind],
-		)
-		if deltaErr != nil {
-			return nil, deltaErr
+		relative, err := filepath.Rel(pkg.InstalledPath, path)
+		if err != nil {
+			return nil, err
 		}
-		filters[kind] = effective
+		kind := packagecontent.Kind(item.ResourceType)
+		filters[kind] = append(filters[kind], filepath.ToSlash(relative))
 	}
 	return filters, nil
 }
@@ -339,18 +379,13 @@ func effectiveConfiguredPackageFilters(pkg configuredPackage, resolvers ...extso
 // extensionLoadFailureHint mirrors upstream main.ts EXTENSION_LOAD_FAILURE_HINT.
 const extensionLoadFailureHint = `Hint: Start without extensions using "` + codingagent.AppName + ` -ne".`
 
-// validateConfiguredPackagesForStartup validates the configured Packages for
-// session startup and returns a Package failure as the error. An extension
-// that does not resolve does not fail its Package: the extension collector
-// emits it as an unresolved config, and the final extension load reports it
-// with every other extension failure, as upstream main.ts reports all
-// extension errors together before it exits. A Package whose scope does not
-// load extensions, as under --no-extensions, validates without resolving its
-// extensions, so the hint's `-ne` recovery starts the session as it does
-// upstream.
+// validateConfiguredPackagesForStartup returns a Package diagnostic without
+// making startup fatal. Manifest parsing matches discovery. Extension failures
+// belong to the final extension load, which reports every failure together.
+// Scopes that do not load extensions skip source resolution.
 func validateConfiguredPackagesForStartup(cwd string, sm *codingagent.SettingsManager, loadsExtensions func(scope string) bool, resolvers ...extsource.ResolveFunc) error {
-	for _, pkg := range configuredPackagesForResolution(cwd, sm) {
-		if pkg.InstalledPath == "" {
+	for _, pkg := range resolvedConfiguredPackageSources(cwd, sm, true) {
+		if configuredPackageNeedsInstall(pkg) {
 			continue
 		}
 		filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
@@ -378,11 +413,15 @@ func (e extensionPathMissingError) Error() string {
 // extensionLoadFailureDiagnostic formats one failed extension as upstream
 // main.ts does: `Failed to load extension "<path>": <loader error>`, where the
 // loader error is `Failed to load extension: <message>` except for a missing
-// -e path.
+// -e path. An extension runtime that reported its own loader error (Node's
+// cell.mjs) already words it as Pi's loader does.
 func extensionLoadFailureDiagnostic(path string, err error) codingagent.AgentSessionRuntimeDiagnostic {
 	message := "Failed to load extension: " + err.Error()
 	if _, missing := errors.AsType[extensionPathMissingError](err); missing {
 		message = err.Error()
+	}
+	if factoryErr, reported := errors.AsType[*subprocess.FactoryLoadError](err); reported {
+		message = factoryErr.Error()
 	}
 	return codingagent.AgentSessionRuntimeDiagnostic{Type: "error", Message: fmt.Sprintf(`Failed to load extension "%s": %s`, path, message)}
 }
@@ -428,103 +467,26 @@ func invalidConfiguredPackageError(pkg configuredPackage, err error) error {
 }
 
 func collectPackagePromptPaths(cwd string, sm *codingagent.SettingsManager, resolvers ...extsource.ResolveFunc) []string {
-	var paths []string
-	for _, pkg := range configuredPackagesForResolution(cwd, sm) {
-		root := pkg.InstalledPath
-		if root == "" {
-			continue
-		}
-		filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
-		if err != nil {
-			continue
-		}
-		resources, err := packagecontent.Discover(root)
-		if err != nil {
-			continue
-		}
-		for _, src := range resources.PromptFiles {
-			rel, _ := filepath.Rel(root, src)
-			if packagecontent.ResourceEnabled(rel, filters[packagecontent.Prompts]) {
-				paths = append(paths, src)
-			}
-		}
-	}
-	return paths
+	return collectEnabledPackagePaths(cwd, sm, packagecontent.Prompts, nil, resolvers...)
 }
 
 func collectPackageThemePaths(cwd string, sm *codingagent.SettingsManager, resolvers ...extsource.ResolveFunc) []string {
-	var paths []string
-	for _, pkg := range configuredPackagesForResolution(cwd, sm) {
-		root := pkg.InstalledPath
-		if root == "" {
-			continue
-		}
-		filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
-		if err != nil {
-			continue
-		}
-		resources, err := packagecontent.Discover(root)
-		if err != nil {
-			continue
-		}
-		for _, src := range resources.ThemeFiles {
-			rel, _ := filepath.Rel(root, src)
-			if packagecontent.ResourceEnabled(rel, filters[packagecontent.Themes]) {
-				paths = append(paths, src)
-			}
-		}
-	}
-	return paths
+	return collectEnabledPackagePaths(cwd, sm, packagecontent.Themes, nil, resolvers...)
 }
 
 func collectPackageSkillPaths(cwd string, sm *codingagent.SettingsManager, ambientScopes *[]string, resolvers ...extsource.ResolveFunc) []string {
-	var paths []string
-	for _, pkg := range configuredPackagesForResolution(cwd, sm) {
-		if !packageScopeEnabled(ambientScopes, pkg.Scope) {
-			continue
-		}
-		root := pkg.InstalledPath
-		if root == "" {
-			continue
-		}
-		filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
-		if err != nil {
-			continue
-		}
-		resources, err := packagecontent.Discover(root)
-		if err != nil {
-			continue
-		}
-		for _, src := range resources.SkillDirs {
-			rel, _ := filepath.Rel(root, filepath.Join(src, "SKILL.md"))
-			if packagecontent.ResourceEnabled(rel, filters[packagecontent.Skills]) {
-				paths = append(paths, src)
-			}
-		}
-	}
-	return paths
+	return collectEnabledPackagePaths(cwd, sm, packagecontent.Skills, ambientScopes, resolvers...)
 }
 
 func collectPackageExtensionConfigs(cwd string, sm *codingagent.SettingsManager, ambientScopes *[]string, resolvers ...extsource.ResolveFunc) []subprocess.ExtConfig {
+	items, _ := collectResolvedPackageResourceItems(cwd, sm, ambientScopes, false, resolvers...)
 	var configs []subprocess.ExtConfig
-	for _, pkg := range configuredPackagesForResolution(cwd, sm) {
-		if !packageScopeEnabled(ambientScopes, pkg.Scope) {
+	for _, item := range items {
+		if item.ResourceType != "extensions" || !item.Enabled {
 			continue
 		}
-		root := pkg.InstalledPath
-		if root == "" {
-			continue
-		}
-		filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
-		if err != nil {
-			continue
-		}
-		for _, config := range packageExtensionConfigs(root, filters[packagecontent.Extensions], resolvers...) {
-			path := config.Source
-			if path == "" {
-				path = config.Path
-			}
-			config.SourceInfo = codingagent.PiSourceInfo{Path: path, Source: pkg.Source.Source, Scope: pkg.Scope, Origin: "package", BaseDir: root}
+		for _, config := range pathToExtConfigs(item.Path, resolvers...) {
+			config.SourceInfo = codingagent.PiSourceInfo{Path: item.Path, Source: item.Source, Scope: item.Scope, Origin: "package", BaseDir: item.BaseDir}
 			configs = append(configs, config)
 		}
 	}
@@ -584,6 +546,11 @@ func trustedAmbientScopes(scopes *[]string) *[]string {
 }
 
 func configuredPackagesForResolution(cwd string, sm *codingagent.SettingsManager) []configuredPackage {
+	return resolvedConfiguredPackageSources(cwd, sm, false)
+}
+
+// resolvedConfiguredPackageSources keeps separate project deltas for resource accumulation; installation consumers share the inherited user package.
+func resolvedConfiguredPackageSources(cwd string, sm *codingagent.SettingsManager, resourceEntries bool) []configuredPackage {
 	global := sm.GetGlobalSettings().Packages
 	project := sm.GetProjectSettings().Packages
 	globals := make([]configuredPackage, 0, len(global))
@@ -610,26 +577,17 @@ func configuredPackagesForResolution(cwd string, sm *codingagent.SettingsManager
 		seenProject[identity] = struct{}{}
 		globalIndex, inherited := globalByIdentity[identity]
 		if inherited && isProjectPackageDelta(pkg) {
-			delta := pkg
-			globals[globalIndex].ProjectDelta = &delta
+			if resourceEntries {
+				projects = append(projects, configuredPackage{Source: pkg, Scope: "project", InstalledPath: globals[globalIndex].InstalledPath, ResolvedSource: globals[globalIndex].Source.Source})
+			}
 			continue
 		}
 		if inherited {
 			delete(globalByIdentity, identity)
 			globals[globalIndex].Source.Source = ""
 		}
-		base := pkg
-		if isProjectPackageDelta(pkg) {
-			base = codingagent.PackageSource{
-				Source: pkg.Source, Extensions: []string{}, Skills: []string{}, Prompts: []string{}, Themes: []string{},
-			}
-		}
-		delta := (*codingagent.PackageSource)(nil)
-		if isProjectPackageDelta(pkg) {
-			delta = &pkg
-		}
 		projects = append(projects, configuredPackage{
-			Source: base, ProjectDelta: delta, Scope: "project", InstalledPath: installedPathForConfiguredSource(cwd, sm, pkg.Source, true),
+			Source: pkg, Scope: "project", InstalledPath: installedPathForConfiguredSource(cwd, sm, pkg.Source, true),
 		})
 	}
 	out := projects
@@ -643,7 +601,7 @@ func configuredPackagesForResolution(cwd string, sm *codingagent.SettingsManager
 
 func installedPathForConfiguredSource(cwd string, sm *codingagent.SettingsManager, source string, local bool) string {
 	if detectSourceKind(source) != "local" {
-		return installedPathForSource(cwd, source, local)
+		return installedPathForSource(cwd, sm, source, local)
 	}
 	root, err := resolveLocalPackageRoot(settingsBaseDirForManager(sm, local), source)
 	if err != nil {
@@ -656,30 +614,37 @@ func installedPathForConfiguredSource(cwd string, sm *codingagent.SettingsManage
 }
 
 func isProjectPackageDelta(pkg codingagent.PackageSource) bool {
-	found := false
-	for _, entries := range [][]string{pkg.Extensions, pkg.Skills, pkg.Prompts, pkg.Themes} {
-		if entries == nil {
-			continue
-		}
-		found = true
-		for _, entry := range entries {
-			if entry == "" || !strings.ContainsRune("+-!", rune(entry[0])) {
-				return false
-			}
-		}
-	}
-	return found
+	return pkg.Autoload != nil && !*pkg.Autoload
 }
 
+// resolveSettingsPath is Pi's resolvePath(p, baseDir, { trim: true }) for
+// settings entries and already-resolved CLI paths. An invalid file: URL keeps
+// the entry joined to baseDir and is silently dropped later, where Pi throws
+// (REVIEW-CLIEXT-017 in docs/parity/KNOWN-GAPS-0.3.x.md).
 func resolveSettingsPath(baseDir, p string) string {
-	if p == "" || filepath.IsAbs(p) {
+	if p == "" {
+		return p
+	}
+	if resolved, err := resolvepath.ResolveTrimmed(p, baseDir); err == nil {
+		return resolved
+	}
+	if filepath.IsAbs(p) {
 		return p
 	}
 	return filepath.Clean(filepath.Join(baseDir, p))
 }
 
 func dedupStrings(in []string) []string {
-	return packagecontent.Deduplicate(in)
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, value := range in {
+		key := canonicalStatusPath(value)
+		if value != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func pathToExtConfig(path string) (subprocess.ExtConfig, bool) {

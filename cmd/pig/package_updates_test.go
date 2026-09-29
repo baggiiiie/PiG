@@ -28,6 +28,7 @@ func TestParseNpmSpec(t *testing.T) {
 	}
 }
 
+// Pi package-manager.ts:59-65 pins exact versions, not mutable dist tags or ranges.
 func TestIsPinnedNpm(t *testing.T) {
 	cases := []struct {
 		source string
@@ -35,9 +36,11 @@ func TestIsPinnedNpm(t *testing.T) {
 	}{
 		{"npm:foo", false},
 		{"npm:foo@1.2.3", true},
-		{"npm:foo@latest", true},
+		{"npm:foo@latest", false},
 		{"npm:@scope/foo", false},
-		{"npm:@scope/foo@beta", true},
+		{"npm:@scope/foo@beta", false},
+		{"npm:foo@^1.2.0", false},
+		{"npm:foo@v1.2.3", true},
 	}
 	for _, tc := range cases {
 		if got := isPinnedNpm(tc.source); got != tc.want {
@@ -69,7 +72,7 @@ func TestEnsureConfiguredPackagesInstalledTreatsProjectDeltaAsInherited(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := settings.SetProjectPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(projectSource), Prompts: []string{"-prompts/one.md"}}}); err != nil {
+	if err := settings.SetProjectPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(projectSource), Autoload: new(false), Prompts: []string{"-prompts/one.md"}}}); err != nil {
 		t.Fatal(err)
 	}
 	settings.Reload()

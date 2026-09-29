@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
@@ -128,7 +129,7 @@ func (o *LocalShellOperations) Exec(ctx context.Context, command, cwd string, op
 	if err := cmd.Start(); err != nil {
 		_ = pw.Close()
 		_ = pr.Close()
-		return BashOperationsResult{}, err
+		return BashOperationsResult{}, &shellSpawnError{path: shell.Path, cause: err}
 	}
 	_ = pw.Close()
 
@@ -219,6 +220,35 @@ func (o *LocalShellOperations) Exec(ctx context.Context, command, cwd string, op
 	code := shellExitCode(cmd.ProcessState)
 	return BashOperationsResult{ExitCode: &code}, nil
 }
+
+// shellSpawnError preserves the spawn errno with Node's user-visible message.
+type shellSpawnError struct {
+	path  string
+	cause error
+}
+
+func (e *shellSpawnError) Error() string {
+	code := nodeErrorCode(e.cause)
+	if e.notFound() {
+		code = "ENOENT"
+	}
+	if code != "" {
+		return "spawn " + e.path + " " + code
+	}
+	return e.cause.Error()
+}
+func (e *shellSpawnError) Unwrap() error { return e.cause }
+
+// Is reports a shell that os/exec could not find as fs.ErrNotExist.
+func (e *shellSpawnError) Is(target error) bool {
+	return target == fs.ErrNotExist && e.notFound()
+}
+
+// notFound reports that os/exec found no executable file for the shell.
+// Windows resolves every command's executable before CreateProcess and
+// reports a missing one as exec.ErrNotFound; libuv reports the same spawn as
+// ENOENT on every platform.
+func (e *shellSpawnError) notFound() bool { return errors.Is(e.cause, exec.ErrNotFound) }
 
 // exitStdioGrace mirrors upstream EXIT_STDIO_GRACE_MS (utils/child-process.ts).
 const exitStdioGrace = 100 * time.Millisecond

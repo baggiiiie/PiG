@@ -25,6 +25,7 @@ type TranscriptContext struct {
 }
 
 func newTranscriptContext(messages []Message) TranscriptContext {
+	messages = normalizeMissingMessageContent(messages)
 	context := TranscriptContext{messages: messages}
 	if err := validateTranscriptContext(context); err != nil {
 		return TranscriptContext{err: err}
@@ -40,9 +41,9 @@ func (context TranscriptContext) Messages() []Message {
 	return cloneMessages(context.messages)
 }
 
-// NormalizeContext folds shorthand prompt and tools into a leading system message.
+// NormalizeContext folds shorthand prompt/tools into a leading system message and normalizes missing content to empty block arrays.
 func NormalizeContext(context Context) TranscriptContext {
-	candidate := TranscriptContext{messages: append([]Message(nil), context.Messages...)}
+	candidate := TranscriptContext{messages: normalizeMissingMessageContent(context.Messages)}
 	if context.SystemPrompt != "" || len(context.Tools) > 0 {
 		initial := SystemMessage{Content: SystemText(context.SystemPrompt), ToolsAdded: context.Tools, Timestamp: 0}
 		candidate.messages = append([]Message{initial}, candidate.messages...)
@@ -51,6 +52,37 @@ func NormalizeContext(context Context) TranscriptContext {
 		return TranscriptContext{err: err}
 	}
 	return TranscriptContext{messages: cloneMessages(candidate.messages)}
+}
+
+// Ports packages/ai/src/api/transform-messages.ts
+// Null and omitted content share the empty-array normalization before provider conversion.
+func normalizeMissingMessageContent(messages []Message) []Message {
+	result := append([]Message(nil), messages...)
+	for index, message := range result {
+		switch message := message.(type) {
+		case SystemMessage:
+			if message.Content == nil {
+				message.Content = SystemTextBlocks{}
+			}
+			result[index] = message
+		case UserMessage:
+			if message.Content == nil {
+				message.Content = UserContentBlocks{}
+			}
+			result[index] = message
+		case AssistantMessage:
+			if message.Content == nil {
+				message.Content = []AssistantContentBlock{}
+			}
+			result[index] = message
+		case ToolResultMessage:
+			if message.Content == nil {
+				message.Content = []ToolResultMessageContent{}
+			}
+			result[index] = message
+		}
+	}
+	return result
 }
 
 func CreateInitialSystemMessage(systemPrompt string, tools []ToolSchema) *SystemMessage {
@@ -332,16 +364,9 @@ func ResolveTranscriptTools(messages []Message, supportsToolAdditions bool) Tran
 func systemContentText(content SystemContent) string {
 	switch content := content.(type) {
 	case SystemText:
-		return string(content)
+		return ContentText(content)
 	case SystemTextBlocks:
-		var text strings.Builder
-		for i, block := range content {
-			if i > 0 {
-				text.WriteByte('\n')
-			}
-			text.WriteString(block.Text)
-		}
-		return text.String()
+		return ContentText(content)
 	default:
 		return ""
 	}

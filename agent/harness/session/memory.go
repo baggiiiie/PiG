@@ -255,6 +255,29 @@ func (facade *memorySessionFacade) Mutate(ctx context.Context, mutation SessionM
 	})
 }
 
+// EnqueueMutation retains this facade's admission until the shared Session mutation settles.
+// Ports packages/agent/src/harness/session/memory.ts (the asynchronous mutate facade).
+func (facade *memorySessionFacade) EnqueueMutation(ctx context.Context, mutation SessionMutationCallback) (*LineJob, error) {
+	if err := facade.enter(); err != nil {
+		return nil, err
+	}
+	job, err := facade.session.EnqueueMutation(ctx, func(ctx context.Context, mutator SessionMutator) (any, error) {
+		if !facade.isOpen() {
+			return nil, ErrSessionClosed
+		}
+		return mutation(ctx, mutator)
+	})
+	if err != nil {
+		facade.admitted.Done()
+		return nil, err
+	}
+	go func() {
+		<-job.Done()
+		facade.admitted.Done()
+	}()
+	return job, nil
+}
+
 func (facade *memorySessionFacade) GetEntries(ctx context.Context, ids []string) (map[string]Entry, error) {
 	return facadeCall(facade, func() (map[string]Entry, error) { return facade.session.GetEntries(ctx, ids) })
 }

@@ -1,6 +1,6 @@
 package ai
 
-// Mirrors upstream .upstream/current/packages/ai/src/utils/oauth/openai-codex.ts.
+// Ports packages/ai/src/auth/oauth/openai-codex.ts.
 
 import (
 	"context"
@@ -65,7 +65,7 @@ func codexCreateState() (string, error) {
 // parseCodexAuthorizationInput extracts code (and optional state) from user-pasted
 // input. Mirrors upstream parseAuthorizationInput in openai-codex.ts:50-77.
 func parseCodexAuthorizationInput(input string) (code, state string) {
-	v := strings.TrimSpace(input)
+	v := trimJSWhitespace(input)
 	if v == "" {
 		return "", ""
 	}
@@ -140,7 +140,7 @@ func startCodexCallbackServer(expectedState string) (srv *http.Server, listener 
 type codexTokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int64  `json:"expires_in"`
+	ExpiresIn    *int64 `json:"expires_in"`
 }
 
 type TokenFailure struct {
@@ -172,6 +172,10 @@ func RefreshCodexToken(ctx context.Context, refreshToken string) (OAuthCredentia
 }
 
 func postCodexTokenForm(ctx context.Context, form url.Values) (OAuthCredentials, error) {
+	operation := "exchange"
+	if form.Get("grant_type") == "refresh_token" {
+		operation = "refresh"
+	}
 	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -184,19 +188,29 @@ func postCodexTokenForm(ctx context.Context, form url.Values) (OAuthCredentials,
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		if operation == "refresh" {
+			return OAuthCredentials{}, fmt.Errorf("OpenAI Codex token refresh error: %w", err)
+		}
+		if ctx.Err() != nil {
+			return OAuthCredentials{}, errors.New("Login cancelled")
+		}
 		return OAuthCredentials{}, fmt.Errorf("token exchange: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return OAuthCredentials{}, fmt.Errorf("token exchange HTTP %d: %s", resp.StatusCode, string(respBody))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := string(respBody)
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return OAuthCredentials{}, fmt.Errorf("OpenAI Codex token %s failed (%d): %s", operation, resp.StatusCode, message)
 	}
 	var tok codexTokenResponse
 	if err := json.Unmarshal(respBody, &tok); err != nil {
 		return OAuthCredentials{}, fmt.Errorf("token exchange invalid JSON: %w", err)
 	}
-	if tok.AccessToken == "" || tok.RefreshToken == "" || tok.ExpiresIn == 0 {
-		return OAuthCredentials{}, fmt.Errorf("token response missing required fields")
+	if tok.AccessToken == "" || tok.RefreshToken == "" || tok.ExpiresIn == nil {
+		return OAuthCredentials{}, fmt.Errorf("OpenAI Codex token %s response missing fields: %s", operation, respBody)
 	}
 	return OAuthCredentials{
 		Refresh: tok.RefreshToken,
@@ -204,7 +218,7 @@ func postCodexTokenForm(ctx context.Context, form url.Values) (OAuthCredentials,
 		// Mirror upstream's "now + expires_in*1000": no 5-minute safety
 		// margin (upstream stores raw; refresh-when-expired is checked
 		// against wall clock at access time).
-		Expires: time.Now().UnixMilli() + tok.ExpiresIn*1000,
+		Expires: time.Now().UnixMilli() + *tok.ExpiresIn*1000,
 	}, nil
 }
 
@@ -294,7 +308,7 @@ func codexParseInterval(v any) (float64, bool) {
 		}
 		return t, true
 	case string:
-		trimmed := strings.TrimSpace(t)
+		trimmed := trimJSWhitespace(t)
 		if trimmed == "" {
 			return 0, true
 		}
@@ -589,9 +603,9 @@ func (c CodexOAuthProvider) LoginContext(ctx context.Context, callbacks OAuthLog
 	}
 	switch method {
 	case OpenAICodexDeviceCodeLoginMethod:
-		return LoginOpenAICodexDeviceCode(ctx, callbacks.OnDeviceCode)
+		return codexCredentialsFromToken(LoginOpenAICodexDeviceCode(ctx, callbacks.OnDeviceCode))
 	case OpenAICodexBrowserLoginMethod:
-		return LoginOpenAICodex(ctx, callbacks)
+		return codexCredentialsFromToken(LoginOpenAICodex(ctx, callbacks))
 	default:
 		return OAuthCredentials{}, fmt.Errorf("Unknown OpenAI Codex login method: %s", method)
 	}
@@ -600,5 +614,17 @@ func (c CodexOAuthProvider) RefreshToken(creds OAuthCredentials) (OAuthCredentia
 	return c.RefreshTokenContext(context.Background(), creds)
 }
 func (CodexOAuthProvider) RefreshTokenContext(ctx context.Context, creds OAuthCredentials) (OAuthCredentials, error) {
-	return RefreshCodexToken(ctx, creds.Refresh)
+	return codexCredentialsFromToken(RefreshCodexToken(ctx, creds.Refresh))
+}
+
+func codexCredentialsFromToken(credentials OAuthCredentials, err error) (OAuthCredentials, error) {
+	if err != nil {
+		return OAuthCredentials{}, err
+	}
+	accountID := CodexAccountID(credentials.Access)
+	if accountID == "" {
+		return OAuthCredentials{}, errors.New("Failed to extract accountId from token")
+	}
+	credentials.AccountID = accountID
+	return credentials, nil
 }

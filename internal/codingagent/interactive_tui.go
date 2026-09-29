@@ -92,7 +92,7 @@ func fullscreenTuiOptions() tui.TuiAltScreenOptions {
 func (m *InteractiveMode) buildChatViewport() ChatViewport {
 	m.ensureLoadedResourcesContainer()
 	return CreateChatViewport(ChatViewportOptions{
-		Document:            tui.NewContainer(m.extHeader, m.loadedResourcesContainer, m.chatContainer),
+		Document:            tui.NewContainer(m.headerContainer(), m.loadedResourcesContainer, m.chatContainer),
 		PendingMessages:     m.pendingMessagesContainer,
 		Status:              m.statusContainer,
 		WidgetsAbove:        m.widgetContainer,
@@ -116,7 +116,7 @@ func (m *InteractiveMode) ensureLoadedResourcesContainer() {
 func (m *InteractiveMode) mountInteractiveTui() {
 	m.ensureLoadedResourcesContainer()
 	layoutChildren := []tui.Component{
-		m.extHeader,
+		m.headerContainer(),
 		m.loadedResourcesContainer,
 		m.chatContainer,
 		m.pendingMessagesContainer,
@@ -198,6 +198,9 @@ func (m *InteractiveMode) switchTuiMode(mode string, restoreProgress bool) bool 
 		m.transcriptScrollView.Dispose()
 		m.transcriptScrollView = nil
 	}
+	if m.themeState.autoSyncEnabled.Load() {
+		m.writeThemeNotifications(false)
+	}
 	m.tuiInst.StopWithOptions(tui.StopOptions{PreserveScreen: true})
 	m.altScreen = nil
 
@@ -234,6 +237,9 @@ func (m *InteractiveMode) switchTuiMode(mode string, restoreProgress bool) bool 
 	// Remount the complete shared component tree into the new renderer, mirroring
 	// upstream remounting every previous child.
 	m.mountInteractiveTui()
+	if m.themeState.autoSyncEnabled.Load() {
+		m.writeThemeNotifications(true)
+	}
 	m.tuiInst.Invalidate()
 
 	// Restore terminal progress if a turn is in flight and progress is enabled
@@ -385,12 +391,24 @@ func (m *InteractiveMode) requestShutdown() {
 	m.postUITask(func() {})
 }
 
-// stopInteractiveTui stops the active renderer, restores cooked mode, and disposes the fullscreen transcript view exactly once. The input loop calls it before extension shutdown and the resume hint; Run also defers it for cancellation and input errors. SIGHUP exits without terminal writes.
+// stopInteractiveTui drains input, stops the renderer while output is raw, then restores cooked mode and disposes the transcript view exactly once. Signal cleanup precedes it; dead-terminal emergencies skip these writes.
 func (m *InteractiveMode) stopInteractiveTui() {
 	if m.tuiTornDown {
 		return
 	}
 	m.tuiTornDown = true
+	m.tuiStopped.Store(true)
+	m.disposeTheme()
+	if m.inputReader != nil {
+		m.inputReader.pause()
+	}
+	if m.rawDrain != nil {
+		m.rawDrain()
+		m.rawDrain = nil
+	} else if m.rawRestore != nil && m.inputReader != nil {
+		// upstream: packages/tui/src/terminal.ts:drainInput
+		_ = m.inputReader.terminal.DrainInput(time.Second, 50*time.Millisecond)
+	}
 	if m.altScreen != nil {
 		if (&SettingsManager{merged: m.opts.Settings}).GetFullscreenExitOutput() == "resume-hint" {
 			m.altScreen.StopWithOptions(tui.StopOptions{PreserveScreen: true})
@@ -417,8 +435,7 @@ func (m *InteractiveMode) stopInteractiveTui() {
 	}
 }
 
-// ShutdownFromSignal emits session_shutdown so extensions can run cleanup
-// before the process tears down, and is safe to call more than once.
+// ShutdownFromSignal emits session_shutdown before requesting owner-loop teardown. Concurrent callers join ongoing cleanup, and repeated calls do not emit again.
 //
 // Upstream's signal-triggered shutdown emits extension cleanup BEFORE touching
 // the terminal, because teardown such as removing sockets does not write to the
@@ -431,23 +448,26 @@ func (m *InteractiveMode) stopInteractiveTui() {
 // processes that no longer exist and extensions would silently never clean up.
 // The caller therefore invokes this before cancelling.
 func (m *InteractiveMode) ShutdownFromSignal() {
-	if m == nil || !m.signalShutdownDone.CompareAndSwap(false, true) {
+	if m == nil {
+		return
+	}
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	if !m.signalShutdownDone.CompareAndSwap(false, true) {
 		return
 	}
 	emitSessionShutdown(m.newRunner, "quit")
+	m.requestShutdown()
 }
 
 // handleInterruptSignal terminates the session on SIGINT, matching upstream,
 // after giving extensions their shutdown event and returning the terminal to
 // cooked mode.
 //
-// Suspended sessions ignore the signal, mirroring upstream's ignoreSigint
-// listener: SIGINT delivered while parked would otherwise land on resume and
-// kill a session the user only backgrounded.
+// The temporary suspend listener is checked at dispatch time. A SIGINT queued while stopped can terminate the process if SIGCONT removes that listener before SIGINT is dispatched, matching Pi's listener lifecycle.
 //
 // Exits rather than unwinding Run because the input loop may be blocked in a
-// read. Only the termios restore runs here; the rest of the teardown writes
-// escape sequences and drains stdin, which the render loop owns.
+// read. Only signal-safe protocol disable and termios restoration run here; normal teardown also drains stdin, which the render loop owns.
 func (m *InteractiveMode) handleInterruptSignal() {
 	if m.suspended.Load() {
 		return

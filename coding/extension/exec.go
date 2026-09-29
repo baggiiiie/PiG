@@ -39,10 +39,10 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 		dir = opts.CWD
 	}
 
-	// Apply timeout if specified.
+	// exec.ts:75: `options?.timeout && options.timeout > 0` starts a Node timer. Node truncates a fractional delay and runs a delay outside [1, 2^31-1] after one millisecond.
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(opts.Timeout)*time.Millisecond)
+		ctx, cancel = context.WithTimeout(ctx, NodeTimerDelay(opts.Timeout))
 		defer cancel()
 	}
 
@@ -96,4 +96,12 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 	}
 
 	return result, nil
+}
+
+// NodeTimerDelay is the delay Node gives setTimeout(fn, ms): it truncates a fractional value and runs a delay outside [1, 2^31-1], or NaN, after one millisecond.
+func NodeTimerDelay(ms float64) time.Duration {
+	if !(ms >= 1 && ms <= 2147483647) {
+		return time.Millisecond
+	}
+	return time.Duration(int64(ms)) * time.Millisecond
 }

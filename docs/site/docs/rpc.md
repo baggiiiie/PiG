@@ -26,9 +26,13 @@ If you omit `--model` and no default model exists, RPC mode starts with Pi's
 to select a model. A prompt fails preflight until the selected provider has
 configured authentication.
 
+The initial active tool list and system-message tool declarations retain extension load and registration order. When several extensions register the same tool name, the first registration wins.
+
 ## Framing
 
 Each input or output record is one JSON object followed by LF (`\n`).
+
+JSON and RPC mode share the event encoder. Event fields follow Pi's construction order rather than alphabetical order. The encoder writes `<`, `>`, `&`, and Unicode line separators as literal characters in JSON strings, including nested records. Parse records as JSON rather than relying on member positions.
 
 - Split records on LF only.
 - Remove a trailing CR when you send CRLF.
@@ -46,6 +50,8 @@ Every command can contain an `id`. The corresponding response repeats it:
 ```
 
 A response confirms command acceptance or reports a command error. Later model or tool failures arrive as events.
+
+A `compact` request aborts and joins the active turn before summarizing. It waits off the input loop, so the client can continue to send state queries and replies to extension dialogs.
 
 ## Pi compatibility boundary
 
@@ -66,6 +72,8 @@ invalidates the old per-Session runner. This difference is D30. Session lifecycl
 events still run before and after each replacement.
 
 ## Events
+
+Partial-message observation across the process boundary is a documented 0.3.x known gap (D82, owner decision 2026-09-28). PiG sends snapshots rather than live producer references. An initial assistant message can therefore contain less content or an earlier stop state than Pi's shallow/live observation. Intermediate Completions snapshots omit `partialArgs` and `streamIndex`; Responses snapshots omit `partialJson`. Final messages must omit these parser properties in both hosts. Event order, deltas, terminal results and persisted messages are not part of this allowance. The strict RPC33 comparison retains the complete raw difference; it is not passing parity.
 
 PiG currently emits these model-loop events:
 

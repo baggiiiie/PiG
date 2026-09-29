@@ -213,7 +213,7 @@ func renderStatus(status statusOutput) {
 	fmt.Printf("  resources: %d (enabled=%d disabled=%d)\n", status.Resources.Total, status.Resources.Enabled, status.Resources.Disabled)
 	fmt.Printf("  piglets: %d (source=%d binary=%d)\n", status.Piglets.Total, status.Piglets.WithSource, status.Piglets.WithBinary)
 	for _, message := range status.Errors {
-		fmt.Fprintln(os.Stderr, "error:", message)
+		printCLIError("%s", message)
 	}
 }
 

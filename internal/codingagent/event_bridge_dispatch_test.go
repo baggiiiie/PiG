@@ -50,7 +50,7 @@ func TestDispatchAgentLoopEvent_DeliversAllAgentLoopEvents(t *testing.T) {
 		},
 		agent.ToolExecutionStartEvent{ToolCallID: "tc1", ToolName: "bash", Args: json.RawMessage(`{"cmd":"ls"}`)},
 		agent.ToolExecutionUpdateEvent{ToolCallID: "tc1", ToolName: "bash", Content: "partial", Details: map[string]any{"progress": float64(1)}, Args: json.RawMessage(`{"cmd":"ls"}`)},
-		agent.ToolExecutionEndEvent{ToolCallID: "tc1", ToolName: "bash", Result: agent.AgentToolResult{Content: "done", Images: []ai.ImageContent{{Data: "aW1n", MimeType: "image/png"}}, Details: map[string]any{"nested": map[string]any{"value": "kept"}}, IsError: true}},
+		agent.ToolExecutionEndEvent{ToolCallID: "tc1", ToolName: "bash", Result: agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "done"}, ai.ImageContent{Data: "aW1n", MimeType: "image/png"}}, Details: map[string]any{"nested": map[string]any{"value": "kept"}}, IsError: true}},
 		agent.MessageEndEvent{Message: agent.AgentMessage{Custom: map[string]any{"marker": "end"}}},
 		agent.TurnEndEvent{TurnIndex: 3},
 		agent.AgentEndEvent{Messages: []agent.AgentMessage{{Custom: map[string]any{"marker": "final"}}}},

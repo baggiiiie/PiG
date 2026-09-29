@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 const (
@@ -112,12 +114,7 @@ func DecodeKittyPrintable(data string) (string, bool) {
 		}
 	}
 	effectiveCodepoint = normalizeKittyFunctionalCodepoint(effectiveCodepoint)
-	// Upstream's String.fromCodePoint throws above U+10FFFF, which it maps to
-	// undefined.
-	if effectiveCodepoint < 32 || effectiveCodepoint > unicode.MaxRune {
-		return "", false
-	}
-	return string(rune(effectiveCodepoint)), true
+	return printableCodepoint(effectiveCodepoint)
 }
 
 type parsedModifyOtherKeysSequence struct {
@@ -150,10 +147,18 @@ func decodeModifyOtherKeysPrintable(data string) (string, bool) {
 	if modifier&^kittyModifierShift != 0 {
 		return "", false
 	}
-	if parsed.codepoint < 32 || parsed.codepoint > unicode.MaxRune {
+	return printableCodepoint(parsed.codepoint)
+}
+
+// String.fromCodePoint accepts UTF-16 surrogate values; only out-of-range values and control characters are rejected by printable decoding.
+func printableCodepoint(codepoint int) (string, bool) {
+	if codepoint < 32 || codepoint > unicode.MaxRune {
 		return "", false
 	}
-	return string(rune(parsed.codepoint)), true
+	if codepoint >= 0xd800 && codepoint <= 0xdfff {
+		return jsstring.FromUTF16([]uint16{uint16(codepoint)}), true
+	}
+	return string(rune(codepoint)), true
 }
 
 // DecodePrintableKey decodes printable terminal sequences from either Kitty

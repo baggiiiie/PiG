@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MichaelKinsy/PiG/coding/packagecontent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/testenv"
 	"github.com/MichaelKinsy/PiG/tui"
@@ -248,16 +247,15 @@ func TestProjectConfigPackageOverrideIsDeltaOverInheritedGlobalPackage(t *testin
 		if packages[0].Scope != "user" {
 			t.Fatalf("effective Package scope = %q, want user", packages[0].Scope)
 		}
-		filters, err := effectiveConfiguredPackageFilters(packages[0])
+		items, err := collectResolvedPackageResourceItems(cwd, settings, nil, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := packagecontent.ResourceEnabled("extensions/alpha", filters[packagecontent.Extensions]); got != targetEnabled {
-			t.Fatalf("alpha enabled = %t, want %t; filters=%v", got, targetEnabled, filters[packagecontent.Extensions])
-		}
-		if !packagecontent.ResourceEnabled("extensions/beta", filters[packagecontent.Extensions]) ||
-			!packagecontent.ResourceEnabled("prompts/review.md", filters[packagecontent.Prompts]) {
-			t.Fatalf("unrelated inherited resources were disabled or promoted: package=%#v filters=%#v", packages[0], filters)
+		for path, wantEnabled := range map[string]bool{"extensions/alpha": targetEnabled, "extensions/beta": true, "prompts/review.md": true} {
+			index := slices.IndexFunc(items, func(item tui.ResourceItem) bool { return item.Path == filepath.Join(packageRoot, path) })
+			if index < 0 || items[index].Enabled != wantEnabled {
+				t.Fatalf("resource %s enabled != %t: %#v", path, wantEnabled, items)
+			}
 		}
 		listed := listConfiguredPackages(cwd, settings)
 		wantListed := 1 + len(settings.GetProjectSettings().Packages)
@@ -332,8 +330,12 @@ func TestProjectDeltaBindsNormalizedRelativeGlobalPackage(t *testing.T) {
 		t.Fatalf("project delta source = %q, want %q", projectPackages[0].Source, projectSource)
 	}
 	packages := configuredPackagesForResolution(cwd, settings)
-	if len(packages) != 1 || packages[0].ProjectDelta == nil || packages[0].Scope != "user" {
-		t.Fatalf("normalized source produced duplicate Packages: %#v", packages)
+	if len(packages) != 1 || packages[0].Scope != "user" || packages[0].InstalledPath != packageRoot {
+		t.Fatalf("normalized source produced duplicate installations: %#v", packages)
+	}
+	resources := resolvedConfiguredPackageSources(cwd, settings, true)
+	if len(resources) != 2 || resources[0].Scope != "project" || resources[1].Scope != "user" || resources[0].InstalledPath != packageRoot || resources[1].InstalledPath != packageRoot {
+		t.Fatalf("resource delta did not retain the inherited install path: %#v", resources)
 	}
 }
 
@@ -436,17 +438,22 @@ func TestProjectPackageDeltaDrivesStartupStatusAndResourceCollectors(t *testing.
 }
 
 func TestProjectPackageDeltaPreservesStrictManifestValidation(t *testing.T) {
-	for name, prepare := range map[string]func(*testing.T, string) string{
-		"lexical traversal": func(t *testing.T, root string) string { return `{"name":"pkg","pi":{"prompts":["../outside.md"]}}` },
-		"absolute path":     func(t *testing.T, root string) string { return `{"name":"pkg","pi":{"prompts":["/tmp/outside.md"]}}` },
-		"symlink escape": func(t *testing.T, root string) string {
+	for name, tc := range map[string]struct {
+		prepare func(*testing.T, string) string
+		// want is the validator's rejection for this escape, not merely any error.
+		want []string
+	}{
+		"lexical traversal": {func(t *testing.T, root string) string { return `{"name":"pkg","pi":{"prompts":["../outside.md"]}}` }, []string{`prompts manifest entry "../outside.md": package resource `, " escapes package root "}},
+		"absolute path":     {func(t *testing.T, root string) string { return `{"name":"pkg","pi":{"prompts":["/tmp/outside.md"]}}` }, []string{`prompts manifest entry "/tmp/outside.md" is not a package-relative path`}},
+		"symlink escape": {func(t *testing.T, root string) string {
 			outside := t.TempDir()
 			if err := os.WriteFile(filepath.Join(outside, "escape.md"), []byte("escape"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			testenv.Symlink(t, outside, filepath.Join(root, "outside"))
+			// A directory link: on Windows a junction, which escapes the Package root as a symbolic link does.
+			testenv.RequireDirectoryLink(t, outside, filepath.Join(root, "outside"))
 			return `{"name":"pkg","pi":{"prompts":["outside/escape.md"]}}`
-		},
+		}, []string{`prompts manifest entry "outside/escape.md": package resource `, " resolves outside package root "}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
@@ -456,7 +463,7 @@ func TestProjectPackageDeltaPreservesStrictManifestValidation(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(prepare(t, packageRoot)), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(tc.prepare(t, packageRoot)), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			settings := codingagent.NewSettingsManager(cwd, agentDir)
@@ -467,12 +474,18 @@ func TestProjectPackageDeltaPreservesStrictManifestValidation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := settings.SetProjectPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(projectSource), Prompts: []string{"-prompts/unused.md"}}}); err != nil {
+			if err := settings.SetProjectPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(projectSource), Autoload: new(false), Prompts: []string{"-prompts/unused.md"}}}); err != nil {
 				t.Fatal(err)
 			}
 			settings.Reload()
-			if err := startupPackageValidationError(cwd, settings); err == nil {
+			err = startupPackageValidationError(cwd, settings)
+			if err == nil {
 				t.Fatal("project delta weakened strict Package validation")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("validation error=%v; want the rejection containing %q", err, want)
+				}
 			}
 		})
 	}

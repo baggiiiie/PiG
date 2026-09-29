@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
@@ -95,7 +96,7 @@ func TestNodeToolRenderersRunInTheExtensionProcess(t *testing.T) {
 	waitForLines(t, call, 30, "call alpha partial=false last=yes calls=2 w=30")
 
 	renderContext.LastComponent = nil
-	result := card.RenderResult(agent.AgentToolResult{Content: "out", Details: map[string]any{"k": "v"}}, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(*toolRenderProxy)
+	result := card.RenderResult(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "out"}}, Details: map[string]any{"k": "v"}}, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(*toolRenderProxy)
 	waitForLines(t, result, 40, "result out v expanded=true calls=2 w=40")
 	if result.session != call.session {
 		t.Fatal("the call and result renderers of one card did not share a session")
@@ -162,7 +163,7 @@ func TestToolRenderersAcrossSDKs(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("context invalidate did not reach the card")
 			}
-			result := card.RenderResult(agent.AgentToolResult{Content: "out", Details: map[string]any{"k": "v"}}, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(*toolRenderProxy)
+			result := card.RenderResult(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "out"}}, Details: map[string]any{"k": "v"}}, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(*toolRenderProxy)
 			waitForLines(t, result, 40, "result out v expanded=true calls=1 w=40")
 
 			throwing := loaded[0].Tools["throwing_tool"].Definition

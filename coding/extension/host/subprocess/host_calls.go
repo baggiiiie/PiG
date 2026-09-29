@@ -1,12 +1,17 @@
 package subprocess
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+
+	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
@@ -27,8 +32,11 @@ import (
 // Promise. Such a call starts in lane order and then runs on its own goroutine.
 func startsAsync(method string) bool {
 	switch method {
+	case "ui.addAutocompleteProvider", "ui.autocomplete.invoke":
+		// The public call remains synchronous in its SDK. A reverse factory/provider callback can reenter the host, so release its call lane at callback initiation.
+		return true
 	case "ui.select", "ui.confirm", "ui.input", "ui.editor", CallUICustom,
-		"setModel", "exec", "complete", "modelStream", "getModelAuth", "compact",
+		"setModel", "registerProvider", "exec", "complete", "modelStream", CallProviderObject, "getModelAuth", "getProviderAuth", "refreshModelRegistry", "compact",
 		"waitForIdle", "newSession", "fork", "navigateTree", "switchSession", "reload",
 		CallOAuthOnPrompt, CallOAuthOnSelect, CallOAuthOnManualCodeInput:
 		return true
@@ -83,6 +91,19 @@ func (l *callLanes) drain(lane string, current *callLane) {
 	}
 }
 
+// barrier returns once every call queued before it has run. A Promise-shaped
+// call has run once it applied its synchronous part.
+func (l *callLanes) barrier() {
+	var reached sync.WaitGroup
+	l.mu.Lock()
+	for _, lane := range l.lanes {
+		reached.Add(1)
+		lane.queue = append(lane.queue, reached.Done)
+	}
+	l.mu.Unlock()
+	reached.Wait()
+}
+
 // queueCall orders one extension→host call. A Promise-shaped call runs on its
 // own goroutine, and the lane advances once the call has applied its
 // synchronous part (it marks initiation) or has finished, whichever is first.
@@ -114,7 +135,13 @@ func (h *Host) queueCall(me *managedExt, lanes *callLanes, callID string, call *
 // non-nil, is the call's initiation mark.
 func (h *Host) runCall(me *managedExt, callID string, call *CallPayload, mark func()) {
 	callCtx, releaseCall := me.conn.hostCallContext(call.ParentRequestID, callID)
+	if h.uiBridge != nil {
+		defer h.uiBridge.releaseAutocompleteCall(me.conn, call)
+	}
 	defer releaseCall()
+	if callCtx.Err() != nil || !h.acceptsNodeGeneration(me) {
+		return
+	}
 	if mark != nil {
 		callCtx = extension.WithCallInitiation(callCtx, mark)
 	}
@@ -143,14 +170,28 @@ func (h *Host) runCall(me *managedExt, callID string, call *CallPayload, mark fu
 	var result *CallResultPayload
 	var err error
 	switch {
+	case call.Method == CallRegisterTool:
+		result, err = h.handleToolRegistration(callCtx, me, call)
 	case call.Method == "event.subscribe" || call.Method == "event.unsubscribe":
 		result, err = h.handleEventSubscription(me, call)
+	case call.Method == "provider.retain" || call.Method == "provider.release":
+		result, err = h.handleProviderReference(me, call)
+	case call.Method == CallProviderObject:
+		result, err = h.handleProviderObject(callCtx, me, call)
+	case call.Method == CallProviderPublish || call.Method == CallProviderCallback:
+		result, err = h.handleProviderPublication(callCtx, me, call)
+	case call.Method == "registerProvider" || call.Method == "unregisterProvider":
+		result, err = h.handleProviderRegistrationCall(callCtx, me, call)
 	case strings.HasPrefix(call.Method, "oauth.cb."):
 		result, err = h.handleOAuthCallback(callCtx, me.config.Name, call)
 	case h.uiBridge != nil:
 		result, err = h.uiBridge.handleCall(callCtx, me.config.Name, me.conn, call)
 	case h.onCall != nil:
 		result, err = h.onCall(me.config.Name, call)
+	}
+	if (call.Method == "setModel" || takesInteractiveFocus(call.Method)) && err == nil {
+		// Pi's model changes and dialogs expose current state before their Promise settles, including cancellation and dialog errors returned in the payload.
+		err = h.pushStateTo(callCtx, me)
 	}
 	if callID == "" {
 		return
@@ -182,4 +223,75 @@ func (h *Host) runCall(me *managedExt, callID string, call *CallPayload, mark fu
 			}},
 		})
 	}
+}
+
+// handleProviderRegistrationCall applies a provider registration an extension
+// makes after it loaded, through pi.registerProvider or
+// ctx.modelRegistry.registerProvider, and the matching unregistrations.
+// Upstream's bindCore makes both take effect immediately (runner.ts), in the
+// one registry every extension shares.
+func (h *Host) handleProviderRegistrationCall(ctx context.Context, me *managedExt, call *CallPayload) (*CallResultPayload, error) {
+	var request struct {
+		Name   string                     `json:"name"`
+		Config json.RawMessage            `json:"config"`
+		Native *NativeProviderDeclaration `json:"native"`
+	}
+	if err := json.Unmarshal(call.Args, &request); err != nil {
+		return nil, fmt.Errorf("parse %s args: %w", call.Method, err)
+	}
+	if strings.TrimSpace(request.Name) == "" {
+		return nil, errors.New("provider name must not be empty")
+	}
+	if call.Method == "unregisterProvider" {
+		h.mu.Lock()
+		released := h.retireNativeProviderLocked(request.Name)
+		me.providerNames = slices.DeleteFunc(me.providerNames, func(name string) bool { return name == request.Name })
+		oauth := slices.Contains(me.oauthProviderNames, request.Name)
+		me.oauthProviderNames = slices.DeleteFunc(me.oauthProviderNames, func(name string) bool { return name == request.Name })
+		h.mu.Unlock()
+		h.releaseProviderCallbacks(released)
+		h.providerRuntime.UnregisterProvider(request.Name)
+		if oauth {
+			ai.UnregisterOAuthProvider(request.Name)
+		}
+		if h.uiBridge != nil {
+			h.uiBridge.ForgetProviderRegistration(request.Name)
+		}
+		return &CallResultPayload{}, nil
+	}
+	if request.Native != nil {
+		if request.Native.ID != request.Name {
+			return nil, errors.New("native provider id does not match registration")
+		}
+		if err := h.registerNativeProvider(ctx, me, request.Native); err != nil {
+			return nil, err
+		}
+		return &CallResultPayload{}, nil
+	}
+	var config extension.ProviderConfig
+	if err := json.Unmarshal(request.Config, &config); err != nil {
+		return nil, fmt.Errorf("provider %s: decode config: %w", request.Name, err)
+	}
+	if err := h.providerRuntime.RegisterProvider(request.Name, config, extConfigOrigin(me.config)); err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	released := h.retireNativeProviderLocked(request.Name)
+	h.mu.Unlock()
+	h.releaseProviderCallbacks(released)
+	h.mu.Lock()
+	if !slices.Contains(me.providerNames, request.Name) {
+		me.providerNames = append(me.providerNames, request.Name)
+	}
+	registeredOAuth := slices.Contains(me.oauthProviderNames, request.Name)
+	h.mu.Unlock()
+	if !registeredOAuth {
+		if err := h.registerOAuthProvider(me, request.Name, request.Config); err != nil {
+			return nil, err
+		}
+	}
+	if h.uiBridge != nil {
+		h.uiBridge.RecordProviderRegistration(request.Name, request.Config)
+	}
+	return &CallResultPayload{}, nil
 }

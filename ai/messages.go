@@ -87,9 +87,9 @@ func (ImageContent) isToolResultMessageContent() {}
 type SystemMessage struct {
 	Content      SystemContent   `json:"content"`
 	Sections     OrderedSections `json:"sections,omitempty"`
+	Timestamp    int64           `json:"timestamp"`
 	ToolsAdded   []ToolSchema    `json:"toolsAdded,omitempty"`
 	ToolsRemoved []ToolReference `json:"toolsRemoved,omitempty"`
-	Timestamp    int64           `json:"timestamp"`
 }
 
 func (SystemMessage) messageRole() string { return "system" }
@@ -169,12 +169,12 @@ func marshalMessage(role string, value any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return nil, err
+	// Role is inserted before the message fields without decoding nested objects into maps.
+	prefix := []byte(fmt.Sprintf(`{"role":%q`, role))
+	if len(body) > 2 {
+		prefix = append(prefix, ',')
 	}
-	fields["role"] = json.RawMessage(fmt.Sprintf("%q", role))
-	return json.Marshal(fields)
+	return append(prefix, body[1:]...), nil
 }
 
 func (message SystemMessage) MarshalJSON() ([]byte, error) {
@@ -234,7 +234,9 @@ func cloneAssistantContent(blocks []AssistantContentBlock) []AssistantContentBlo
 		case ThinkingContent:
 			out[i] = value
 		case ToolCall:
-			value.Arguments = JsonObject(cloneJSONValue(value.Arguments).(map[string]any))
+			if value.Arguments != nil {
+				value.Arguments = JsonObject(cloneJSONValue(value.Arguments).(map[string]any))
+			}
 			out[i] = value
 		default:
 			panic(fmt.Sprintf("unsupported assistant content block %T", block))

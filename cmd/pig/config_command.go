@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
@@ -160,75 +159,60 @@ var normalizeConfigInputSequence = tui.NormalizeProcessInputSequence
 // component; handing a release to the selector moves its cursor a second time.
 // Takes a reader so the loop a user drives is the loop under test.
 func driveConfigSelector(ui *tui.TUI, selector *tui.ConfigSelectorComponent, source io.Reader) error {
+	ctx, cancel := context.WithCancel(context.Background())
 	done := false
 	selector.OnCancel = func() { done = true }
 	selector.OnExit = func() { done = true }
-	stdinBuf := codingagent.NewStdinBuffer(codingagent.StdinBufferOptions{
-		EscapeTimeout: time.Duration(tui.ResolveEscapeTimeoutMs(os.Getenv) * float64(time.Millisecond)),
-	})
-	dispatch := func(chunks []string) {
-		for _, chunk := range chunks {
-			// Mirrors upstream ProcessTerminal.forwardInputSequence.
-			chunk = normalizeConfigInputSequence(chunk)
-			if !tui.ShouldDeliverKey(selector, chunk) {
-				continue
-			}
+	var input *tui.TerminalInput
+	input = tui.NewTerminalInput(func(chunk string) {
+		if done {
+			return
+		}
+		chunk = normalizeConfigInputSequence(chunk)
+		if tui.ShouldDeliverKey(selector, chunk) {
 			selector.HandleInput(chunk)
-			if done {
-				return
+		}
+		if done {
+			input.Close()
+		}
+	})
+	defer input.Close()
+	readCh := make(chan []byte)
+	errCh := make(chan error, 1)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		errCh <- tui.ReadInputStream(ctx, source, func(data []byte) {
+			select {
+			case readCh <- data:
+			case <-ctx.Done():
 			}
-		}
-	}
-	type readResult struct {
-		data []byte
-		err  error
-	}
-	readCh := make(chan readResult, 1)
-	readNext := func() {
-		go func() {
-			data, err := tui.ReadInput(source)
-			readCh <- readResult{data: data, err: err}
-		}()
-	}
-	var flushTimer *time.Timer
-	var flushC <-chan time.Time
-	stopFlush := func() {
-		if flushTimer != nil {
-			flushTimer.Stop()
-		}
-		flushTimer = nil
-		flushC = nil
-	}
-	syncFlush := func() {
-		stopFlush()
-		if stdinBuf.HasPendingFlush() {
-			flushTimer = time.NewTimer(stdinBuf.FlushTimeout())
-			flushC = flushTimer.C
-		}
-	}
-	defer stopFlush()
+		})
+	}()
+	defer func() { cancel(); <-readDone }()
 
 	ui.Render()
-	readNext()
 	for !done {
+		// A ready continuation precedes an expired framing deadline.
 		select {
-		case result := <-readCh:
-			if result.err != nil {
-				if errors.Is(result.err, io.EOF) {
-					dispatch(stdinBuf.Flush())
-					return nil
-				}
-				return result.err
-			}
-			dispatch(stdinBuf.ProcessTerminalBytes(result.data))
-			syncFlush()
+		case data := <-readCh:
+			input.Process(data)
 			ui.Render()
-			if !done {
-				readNext()
+			continue
+		default:
+		}
+		select {
+		case data := <-readCh:
+			input.Process(data)
+			ui.Render()
+		case err := <-errCh:
+			input.FlushPending()
+			if errors.Is(err, io.EOF) {
+				return nil
 			}
-		case <-flushC:
-			stopFlush()
-			dispatch(stdinBuf.Flush())
+			return err
+		case <-input.C:
+			input.Flush()
 			ui.Render()
 		}
 	}
@@ -256,6 +240,9 @@ func collectConfigResourceItems(cwd, agentDir string, sm *codingagent.SettingsMa
 	appendTopLevel := func(entries []string, scope, source, baseDir, kind string, autoPaths []string) {
 		resourceType := tui.ResourceType(kind)
 		plain, patterns := splitResourcePatterns(entries)
+		if source != "local" {
+			plain = nil
+		}
 		resolved := make([]string, 0, len(plain))
 		for _, entry := range plain {
 			resolved = append(resolved, resolveSettingsPath(baseDir, entry))
@@ -296,55 +283,37 @@ func collectConfigResourceItems(cwd, agentDir string, sm *codingagent.SettingsMa
 	appendTopLevel(global.Prompts, "user", "local", userBase, "prompts", nil)
 	appendTopLevel(global.Themes, "user", "local", userBase, "themes", nil)
 
-	home, _ := os.UserHomeDir()
-	userAgentsSkills := filepath.Join(home, ".agents", "skills")
+	userAgentsSkills := filepath.Join(packageManagerHomeDir(), ".agents", "skills")
 	projectAgentSkillDirs := make([]string, 0)
 	for _, dir := range discoverAncestorAgentsSkillDirs(cwd) {
 		if samePath(dir, userAgentsSkills) {
 			continue
 		}
-		projectAgentSkillDirs = append(projectAgentSkillDirs, discoverSkillDir(dir)...)
+		projectAgentSkillDirs = append(projectAgentSkillDirs, dir)
 	}
 	if projectResourcesEnabled {
 		appendTopLevel(project.Extensions, "project", "auto", projectBase, "extensions", collectAutoDiscoveredResourcePaths(filepath.Join(projectBase, "extensions"), "extensions"))
 		appendTopLevel(project.Skills, "project", "auto", projectBase, "skills", collectAutoDiscoveredResourcePaths(filepath.Join(projectBase, "skills"), "skills"))
-		for _, path := range projectAgentSkillDirs {
-			appendTopLevel(project.Skills, "project", "auto", filepath.Dir(filepath.Dir(path)), "skills", []string{path})
+		for _, dir := range projectAgentSkillDirs {
+			appendTopLevel(project.Skills, "project", "auto", filepath.Dir(dir), "skills", discoverSkillDir(dir))
 		}
 		appendTopLevel(project.Prompts, "project", "auto", projectBase, "prompts", collectAutoDiscoveredResourcePaths(filepath.Join(projectBase, "prompts"), "prompts"))
 		appendTopLevel(project.Themes, "project", "auto", projectBase, "themes", collectAutoDiscoveredResourcePaths(filepath.Join(projectBase, "themes"), "themes"))
 	}
 	appendTopLevel(global.Extensions, "user", "auto", userBase, "extensions", collectAutoDiscoveredResourcePaths(filepath.Join(userBase, "extensions"), "extensions"))
 	appendTopLevel(global.Skills, "user", "auto", userBase, "skills", collectAutoDiscoveredResourcePaths(filepath.Join(userBase, "skills"), "skills"))
-	for _, path := range discoverSkillDir(userAgentsSkills) {
-		appendTopLevel(global.Skills, "user", "auto", filepath.Dir(filepath.Dir(path)), "skills", []string{path})
-	}
+	appendTopLevel(global.Skills, "user", "auto", filepath.Dir(userAgentsSkills), "skills", discoverSkillDir(userAgentsSkills))
 	appendTopLevel(global.Prompts, "user", "auto", userBase, "prompts", collectAutoDiscoveredResourcePaths(filepath.Join(userBase, "prompts"), "prompts"))
 	appendTopLevel(global.Themes, "user", "auto", userBase, "themes", collectAutoDiscoveredResourcePaths(filepath.Join(userBase, "themes"), "themes"))
 
-	projectPkgs := make([]configuredPackage, 0)
-	userPkgs := make([]configuredPackage, 0)
-	for _, pkg := range listConfiguredPackages(cwd, sm) {
-		if pkg.Scope == "project" {
-			projectPkgs = append(projectPkgs, pkg)
-		} else {
-			userPkgs = append(userPkgs, pkg)
-		}
+	pkgItems, err := collectResolvedPackageResourceItems(cwd, sm, nil, true, resolvers...)
+	if err != nil {
+		return nil, err
 	}
-	for _, pkg := range append(projectPkgs, userPkgs...) {
-		root := pkg.InstalledPath
-		if root == "" {
-			return nil, fmt.Errorf("%s Package %q is not materialized; run pig update %s", pkg.Scope, pkg.Source.Source, pkg.Source.Source)
-		}
-		pkgItems, err := collectPackageResourceItems(root, pkg, resolvers...)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range pkgItems {
-			addItem(item)
-		}
+	for _, item := range pkgItems {
+		addItem(item)
 	}
-	return items, nil
+	return canonicalResourceItems(items), nil
 }
 
 func samePath(a, b string) bool {
@@ -353,22 +322,34 @@ func samePath(a, b string) bool {
 	return err1 == nil && err2 == nil && aa == bb
 }
 
-func collectPackageResourceItems(root string, pkg configuredPackage, resolvers ...extsource.ResolveFunc) ([]tui.ResourceItem, error) {
-	filters, err := effectiveConfiguredPackageFilters(pkg, resolvers...)
+func collectPackageResourceItems(root string, pkg configuredPackage, inspect bool, resolvers ...extsource.ResolveFunc) ([]tui.ResourceItem, error) {
+	filters := configuredPackageFilters(pkg.Source)
+	if isProjectPackageDelta(pkg.Source) {
+		filters = map[packagecontent.Kind][]string{packagecontent.Extensions: {}, packagecontent.Skills: {}, packagecontent.Prompts: {}, packagecontent.Themes: {}}
+	}
+	var resources packagecontent.Resources
+	var missing []packagecontent.MissingMember
+	var err error
+	if inspect {
+		resources, missing, err = packagecontent.InspectConfiguredWithResolver(root, filters, configuredExtensionResolver(resolvers))
+	} else {
+		// Runtime discovery omits missing members and leaves extension failures to the extension loader.
+		resources, err = packagecontent.Discover(root)
+	}
 	if err != nil {
 		return nil, err
 	}
-	resources, missing, err := packagecontent.InspectConfiguredWithResolver(root, filters, configuredExtensionResolver(resolvers))
-	if err != nil {
-		return nil, err
-	}
+	return packageResourceItemsFromInventory(root, pkg, resources, missing, filters), nil
+}
+
+func packageResourceItemsFromInventory(root string, pkg configuredPackage, resources packagecontent.Resources, missing []packagecontent.MissingMember, filters map[packagecontent.Kind][]string) []tui.ResourceItem {
 	out := make([]tui.ResourceItem, 0)
 	for _, path := range resources.ExtensionEntries {
 		rel, _ := filepath.Rel(root, path)
 		out = append(out, tui.ResourceItem{Path: path, Enabled: packagecontent.ResourceEnabled(rel, filters[packagecontent.Extensions]), ResourceType: tui.ResourceExtensions, Scope: pkg.Scope, Origin: "package", Source: pkg.Source.Source, BaseDir: root})
 	}
 	for _, path := range resources.SkillDirs {
-		rel, _ := filepath.Rel(root, filepath.Join(path, "SKILL.md"))
+		rel, _ := filepath.Rel(root, packagecontent.SkillFile(path))
 		out = append(out, tui.ResourceItem{Path: path, Enabled: packagecontent.ResourceEnabled(rel, filters[packagecontent.Skills]), ResourceType: tui.ResourceSkills, Scope: pkg.Scope, Origin: "package", Source: pkg.Source.Source, BaseDir: root})
 	}
 	for _, path := range resources.PromptFiles {
@@ -386,12 +367,12 @@ func collectPackageResourceItems(root string, pkg configuredPackage, resolvers .
 			memberPath = filepath.Dir(memberPath)
 		}
 		out = append(out, tui.ResourceItem{
-			Path: memberPath, Pattern: member.Pattern, Enabled: member.Enabled,
+			Path: memberPath, Pattern: member.Pattern, Enabled: packagecontent.ResourceEnabled(member.Pattern, filters[member.Kind]),
 			ResourceType: resourceType, Scope: pkg.Scope, Origin: "package",
 			Source: pkg.Source.Source, BaseDir: root, Health: "missing",
 		})
 	}
-	return out, nil
+	return applyPackageAutoloadStates(pkg, out)
 }
 
 func applyConfigToggle(cwd, agentDir string, sm *codingagent.SettingsManager, item *tui.ResourceItem, enabled bool) error {
@@ -474,7 +455,7 @@ func applyPackageToggle(cwd string, sm *codingagent.SettingsManager, item *tui.R
 	if pattern == "" {
 		relTarget := item.Path
 		if item.ResourceType == tui.ResourceSkills {
-			relTarget = filepath.Join(item.Path, "SKILL.md")
+			relTarget = packagecontent.SkillFile(item.Path)
 		}
 		var err error
 		pattern, err = filepath.Rel(target.InstalledPath, relTarget)
@@ -565,7 +546,7 @@ func projectConfigOverride(sm *codingagent.SettingsManager, item *tui.ResourceIt
 		}
 		pattern, _ = filepath.Rel(base, item.Path)
 		if item.ResourceType == tui.ResourceSkills && item.Origin == "package" {
-			pattern = filepath.Join(pattern, "SKILL.md")
+			pattern, _ = filepath.Rel(base, packagecontent.SkillFile(item.Path))
 		}
 		pattern = filepath.ToSlash(pattern)
 	}
@@ -605,7 +586,7 @@ func applyProjectConfigOverride(cwd string, sm *codingagent.SettingsManager, ite
 					overrideSource = relative
 				}
 			}
-			packages = append(packages, codingagent.PackageSource{Source: overrideSource})
+			packages = append(packages, codingagent.PackageSource{Source: overrideSource, Autoload: new(false)})
 			index = len(packages) - 1
 		}
 		pkg := packages[index]
@@ -613,9 +594,12 @@ func applyProjectConfigOverride(cwd string, sm *codingagent.SettingsManager, ite
 		if pattern == "" {
 			target := item.Path
 			if item.ResourceType == tui.ResourceSkills {
-				target = filepath.Join(target, "SKILL.md")
+				target = packagecontent.SkillFile(target)
 			}
 			pattern, _ = filepath.Rel(item.BaseDir, target)
+		}
+		if _, err := packagecontent.ApplyConfiguredDelta(packagecontent.Kind(item.ResourceType), []string{filepath.ToSlash(pattern)}, nil, []string{"+" + filepath.ToSlash(pattern)}); err != nil {
+			return err
 		}
 		update := func(entries []string) []string {
 			out := slices.DeleteFunc(slices.Clone(entries), func(entry string) bool {
@@ -623,6 +607,9 @@ func applyProjectConfigOverride(cwd string, sm *codingagent.SettingsManager, ite
 			})
 			if state != "inherit" {
 				out = append(out, map[bool]string{true: "+", false: "-"}[state == "load"]+pattern)
+			}
+			if len(out) == 0 {
+				return nil
 			}
 			return out
 		}
@@ -636,8 +623,12 @@ func applyProjectConfigOverride(cwd string, sm *codingagent.SettingsManager, ite
 		case tui.ResourceThemes:
 			pkg.Themes = update(pkg.Themes)
 		}
-		if state == "inherit" && len(pkg.Extensions) == 0 && len(pkg.Skills) == 0 && len(pkg.Prompts) == 0 && len(pkg.Themes) == 0 {
-			packages = append(packages[:index], packages[index+1:]...)
+		if pkg.Extensions == nil && pkg.Skills == nil && pkg.Prompts == nil && pkg.Themes == nil {
+			if pkg.Autoload != nil && !*pkg.Autoload {
+				packages = slices.Delete(packages, index, index+1)
+			} else {
+				packages[index] = codingagent.PackageSource{Source: pkg.Source}
+			}
 		} else {
 			packages[index] = pkg
 		}

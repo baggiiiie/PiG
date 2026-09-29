@@ -26,6 +26,9 @@ func TestNodeCellRuntimeFailureExitsNonzero(t *testing.T) {
 	} {
 		t.Run(launcher.file, func(t *testing.T) {
 			cmd := exec.CommandContext(testbudget.Context(t), "node", filepath.Join("runtime-node", launcher.file), launcher.arg)
+			if launcher.file == "cell.mjs" {
+				cmd.Stdin = strings.NewReader("\"broken\"\n")
+			}
 			out, err := cmd.CombinedOutput()
 			var exitErr *exec.ExitError
 			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
@@ -86,6 +89,7 @@ assert.equal(process.exitCode, 1, "healthy completion must not erase failure");
 process.exitCode = 0;
 `, runtimePath, manifest, cellPath)
 	cmd := exec.CommandContext(testbudget.Context(t), "node", "--input-type=module", "--eval", script)
+	cmd.Stdin = strings.NewReader("\"broken-a\"\n\"healthy\"\n\"broken-b\"\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("cell runtime failure ordering: %v\n%s", err, out)
 	}

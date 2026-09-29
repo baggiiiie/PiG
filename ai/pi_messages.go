@@ -155,8 +155,12 @@ func (p *piMessagesProvider) send(ctx context.Context, transcript TranscriptCont
 	request.Header.Set("accept", "text/event-stream")
 	request.Header.Set("content-type", "application/json")
 	applyProviderHeaders(request, mergeProviderHeaders(ProviderHeadersFromStrings(p.cfg.ExtraHeaders), opts.Headers))
-	response, err := p.client.Do(request)
+	response, err := providerHTTPClient(p.client, opts.Fetch).Do(request)
 	if err != nil {
+		return nil, err
+	}
+	if err := observeProviderResponse(ctx, opts, response, &Model{ID: p.cfg.Model, ProviderMeta: ProviderMetadata{ProviderID: p.cfg.ProviderID, API: APIPiMessages}}); err != nil {
+		_ = response.Body.Close()
 		return nil, err
 	}
 	if err := p.checkResponse(endpoint, response); err != nil {
@@ -177,11 +181,7 @@ func mergeProviderHeaders(base, override ProviderHeaders) ProviderHeaders {
 
 func (p *piMessagesProvider) checkResponse(endpoint *url.URL, response *http.Response) error {
 	if p.cfg.OnResponse != nil {
-		headers := make(map[string]string, len(response.Header))
-		for name := range response.Header {
-			headers[strings.ToLower(name)] = response.Header.Get(name)
-		}
-		if err := p.cfg.OnResponse(PiMessagesResponse{Status: response.StatusCode, Headers: headers}); err != nil {
+		if err := p.cfg.OnResponse(PiMessagesResponse{Status: response.StatusCode, Headers: headersToRecord(response.Header)}); err != nil {
 			return err
 		}
 	}

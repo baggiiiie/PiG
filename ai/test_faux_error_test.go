@@ -2,7 +2,7 @@ package ai
 
 import "testing"
 
-// parity/testdata/test-faux-provider.ts:emitPlan snapshots an empty pending start before publishing its classified error. Keep both sides of the paired fixture equivalent without changing real providers.
+// test/parity/testdata/test-faux-provider.ts:emitPlan snapshots an empty pending start before publishing its classified error. Keep both sides of the paired fixture equivalent without changing real providers.
 func TestTestFauxClassifiedErrorStartsPending(t *testing.T) {
 	p := &TestFauxProvider{}
 	stream, err := p.Stream(t.Context(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("")}}}), StreamOptions{})

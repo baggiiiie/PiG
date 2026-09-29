@@ -1,7 +1,9 @@
 package ai
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,11 +44,8 @@ func (copilotOAuthRegistryProvider) LoginContext(ctx context.Context, callbacks 
 			}
 			return callbacks.OnPrompt(OAuthPrompt{Message: "GitHub Enterprise URL/domain", Placeholder: "company.ghe.com", AllowEmpty: true})
 		},
+		OnDeviceCode: callbacks.OnDeviceCode,
 		OnAuth: func(url, userCode string) {
-			if callbacks.OnDeviceCode != nil {
-				callbacks.OnDeviceCode(OAuthDeviceCodeInfo{VerificationURI: url, UserCode: userCode})
-				return
-			}
 			if callbacks.OnAuth != nil {
 				instructions := userCode
 				if strings.TrimSpace(userCode) != "" {
@@ -60,17 +59,21 @@ func (copilotOAuthRegistryProvider) LoginContext(ctx context.Context, callbacks 
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
-	return OAuthCredentials{Refresh: cred.Refresh, Access: cred.Access, Expires: cred.Expires}, nil
+	return credentialToOAuth(cred), nil
 }
 func (copilotOAuthRegistryProvider) RefreshToken(creds OAuthCredentials) (OAuthCredentials, error) {
 	return copilotOAuthRegistryProvider{}.RefreshTokenContext(context.Background(), creds)
 }
 func (copilotOAuthRegistryProvider) RefreshTokenContext(ctx context.Context, creds OAuthCredentials) (OAuthCredentials, error) {
-	fresh, err := refreshCopilotToken(ctx, creds.Refresh, "")
+	credential, err := credentialFromOAuth(creds)
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
-	return OAuthCredentials{Refresh: fresh.Refresh, Access: fresh.Access, Expires: fresh.Expires}, nil
+	fresh, err := refreshCopilotToken(ctx, creds.Refresh, credential.EnterpriseDomain)
+	if err != nil {
+		return OAuthCredentials{}, err
+	}
+	return credentialToOAuth(fresh), nil
 }
 func (copilotOAuthRegistryProvider) GetAPIKey(creds OAuthCredentials) string { return creds.Access }
 
@@ -210,13 +213,7 @@ func ResolveOAuthAPIKeyFromStorageContext(ctx context.Context, storage *AuthStor
 
 func resolveStoredOAuthAPIKey(ctx context.Context, storage *AuthStorage, providerID string, credential Credential) (string, error) {
 	next, apiKey, err := GetOAuthAPIKeyContext(ctx, providerID, map[string]OAuthCredentials{
-		providerID: {
-			Refresh:   credential.Refresh,
-			Access:    credential.Access,
-			Expires:   credential.Expires,
-			ProjectID: credential.ProjectID,
-			Scope:     credential.Scope,
-		},
+		providerID: credentialToOAuth(credential),
 	})
 	if err != nil {
 		return "", err
@@ -224,15 +221,20 @@ func resolveStoredOAuthAPIKey(ctx context.Context, storage *AuthStorage, provide
 	if next == nil || apiKey == "" {
 		return "", nil
 	}
-	if next.Refresh != credential.Refresh || next.Access != credential.Access || next.Expires != credential.Expires || next.ProjectID != credential.ProjectID || next.Scope != credential.Scope {
-		if err := storage.Set(providerID, Credential{
-			Type:      CredentialOAuth,
-			Refresh:   next.Refresh,
-			Access:    next.Access,
-			Expires:   next.Expires,
-			ProjectID: next.ProjectID,
-			Scope:     next.Scope,
-		}); err != nil {
+	updated, err := credentialFromOAuth(*next)
+	if err != nil {
+		return "", err
+	}
+	before, err := json.Marshal(credential)
+	if err != nil {
+		return "", err
+	}
+	after, err := json.Marshal(updated)
+	if err != nil {
+		return "", err
+	}
+	if !bytes.Equal(before, after) {
+		if err := storage.Set(providerID, updated); err != nil {
 			return "", err
 		}
 	}

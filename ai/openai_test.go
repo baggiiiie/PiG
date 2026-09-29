@@ -720,11 +720,11 @@ func TestSystemPromptRole_ReasoningModelOnOpenAI(t *testing.T) {
 	}
 }
 
-func TestSystemPromptRole_ReasoningModelOnOllama(t *testing.T) {
+func TestSystemPromptRole_ReasoningModelOnUnconfiguredLocalEndpoint(t *testing.T) {
 	p := &openAIProvider{cfg: OpenAIConfig{BaseURL: "http://localhost:11434/v1"}}
 	role := p.systemPromptRole(true)
-	if role != "system" {
-		t.Errorf("reasoning model on Ollama role = %q, want system (no developer support)", role)
+	if role != "developer" {
+		t.Errorf("unconfigured compatible endpoint role = %q, want Pi's default developer role", role)
 	}
 }
 

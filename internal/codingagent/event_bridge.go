@@ -206,12 +206,7 @@ func toolExecutionArgs(args json.RawMessage) any {
 }
 
 func extensionToolResult(result agent.AgentToolResult) map[string]any {
-	content := make([]any, 0, 1+len(result.Images))
-	content = append(content, map[string]any{"type": "text", "text": result.Content})
-	for _, image := range result.Images {
-		content = append(content, map[string]any{"type": "image", "data": image.Data, "mimeType": image.MimeType})
-	}
-	payload := map[string]any{"content": content}
+	payload := map[string]any{"content": ToolResultEventContent(result)}
 	if result.Details != nil {
 		payload["details"] = result.Details
 	}
@@ -344,11 +339,11 @@ func AgentLoopEventType(ev agent.AgentEvent) string {
 // emitUserBash dispatches a user_bash event. A non-nil error means a handler
 // failed or returned an invalid result; the runner already reported it, and
 // the caller must not run the command (upstream #9068 fails closed).
-func emitUserBash(runner *inproc.Runner, command, cwd string, excludeFromContext bool) (*extension.UserBashEventResult, error) {
+func emitUserBash(ctx context.Context, runner *inproc.Runner, command, cwd string, excludeFromContext bool) (*extension.UserBashEventResult, error) {
 	if runner == nil || !runner.HasHandlers(EventUserBash) {
 		return nil, nil
 	}
-	return runner.EmitUserBash(context.Background(), extension.UserBashEvent{
+	return runner.EmitUserBash(ctx, extension.UserBashEvent{
 		Type:               EventUserBash,
 		Command:            command,
 		Cwd:                cwd,
@@ -409,43 +404,6 @@ func emitThinkingLevelSelect(runner *inproc.Runner, level, previousLevel string)
 			PreviousLevel: previousLevel,
 		})
 	}
-}
-
-// emitSessionBeforeSwitch dispatches session_before_switch.
-// Extensions can cancel the switch. Mirrors upstream interactive-mode.ts emitBeforeSwitch.
-func emitSessionBeforeSwitch(runner *inproc.Runner, reason string, targetFile string) bool {
-	if runner == nil || !runner.HasHandlers(EventSessionBeforeSwitch) {
-		return false
-	}
-	result, _ := runner.Emit(context.Background(), extension.SessionBeforeSwitchEvent{
-		Type:              EventSessionBeforeSwitch,
-		Reason:            reason,
-		TargetSessionFile: targetFile,
-	})
-	if m, ok := result.(map[string]any); ok {
-		if cancel, ok := m["cancel"].(bool); ok {
-			return cancel
-		}
-	}
-	return false
-}
-
-// emitSessionBeforeFork dispatches session_before_fork.
-// Extensions can cancel the fork. Mirrors upstream interactive-mode.ts emitBeforeFork.
-func emitSessionBeforeFork(runner *inproc.Runner, entryID string) bool {
-	if runner == nil || !runner.HasHandlers(EventSessionBeforeFork) {
-		return false
-	}
-	result, _ := runner.Emit(context.Background(), extension.SessionBeforeForkEvent{
-		Type:    EventSessionBeforeFork,
-		EntryID: entryID,
-	})
-	if m, ok := result.(map[string]any); ok {
-		if cancel, ok := m["cancel"].(bool); ok {
-			return cancel
-		}
-	}
-	return false
 }
 
 // modelToExtModel converts an ai.Model to extension.Model (map[string]any).

@@ -3,7 +3,6 @@ package subprocess
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/host/invocation"
 )
@@ -94,10 +95,12 @@ func (e *TransportError) Unwrap() error { return e.Err }
 // goroutines. Only the reader reads the socket, and only the writer writes it.
 // pig-specific: no upstream equivalent.
 type Conn struct {
-	name    string
-	conn    net.Conn
-	closing atomic.Bool
-	closed  atomic.Bool
+	// onDispatch records the owner before a request can run in a shared process.
+	onDispatch func()
+	name       string
+	conn       net.Conn
+	closing    atomic.Bool
+	closed     atomic.Bool
 
 	// Outgoing message queue. Writer goroutine drains this. A frame that is
 	// queued or being written is outstanding work, so the heartbeat runs while
@@ -108,9 +111,10 @@ type Conn struct {
 
 	// Pending request tracking: maps request ID → response channel, and
 	// request ID → the sink for that request's tool_update notifications.
-	pendingMu sync.Mutex
-	pending   map[string]chan *Envelope
-	updates   map[string]func(json.RawMessage)
+	pendingMu     sync.Mutex
+	pending       map[string]chan *Envelope
+	updates       map[string]func(json.RawMessage)
+	producerTasks sync.WaitGroup
 
 	// Incoming messages that aren't responses go here for the host to process.
 	inCh chan *Envelope
@@ -156,8 +160,9 @@ type Conn struct {
 	failure           error
 
 	// cancel signals all goroutines to stop.
-	cancel context.CancelFunc
-	done   chan struct{} // closed when reader, writer, and heartbeat exit
+	cancel   context.CancelFunc
+	lifetime context.Context
+	done     chan struct{} // closed when reader, writer, and heartbeat exit
 }
 
 // NewConn wraps a connected socket into a managed connection.
@@ -201,6 +206,7 @@ func newConnWithOptions(name string, c net.Conn, options connOptions) *Conn {
 // controls their lifetime. Cancellation stops all three goroutines.
 func (c *Conn) Start(ctx context.Context) {
 	ctx, c.cancel = context.WithCancel(ctx)
+	c.lifetime = ctx
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -321,7 +327,20 @@ func (c *Conn) sendAndWait(ctx context.Context, env *Envelope) error {
 	}
 }
 
-func (c *Conn) marshalEnvelope(env *Envelope) ([]byte, error) {
+// encodedEnvelope contains complete JSON produced by a host encoder. It is immutable while queued, so one notification can share its bytes across connections.
+type encodedEnvelope []byte
+
+func (c *Conn) sendEncoded(data encodedEnvelope) error {
+	if err := c.checkSendState(); err != nil {
+		return err
+	}
+	if err := checkFrameSize(data); err != nil {
+		return err
+	}
+	return c.enqueue(context.Background(), outboundFrame{data: data, work: true})
+}
+
+func (c *Conn) checkSendState() error {
 	if c.closing.Load() || c.closed.Load() {
 		// A caller that keeps sending after the connection failed (for example
 		// a retry loop racing the writer's queue drain: a Send already queued
@@ -330,16 +349,30 @@ func (c *Conn) marshalEnvelope(env *Envelope) ([]byte, error) {
 		// the connection's real terminal error, not a generic placeholder that
 		// masks it.
 		if failure := c.failureError(); failure != nil {
-			return nil, failure
+			return failure
 		}
-		return nil, errors.New("connection closed")
+		return errors.New("connection closed")
+	}
+	return nil
+}
+
+func checkFrameSize(data []byte) error {
+	if len(data) > MaxFrameSize {
+		return &FrameTooLargeError{Size: len(data), Max: MaxFrameSize}
+	}
+	return nil
+}
+
+func (c *Conn) marshalEnvelope(env *Envelope) ([]byte, error) {
+	if err := c.checkSendState(); err != nil {
+		return nil, err
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("marshal envelope: %w", err)
 	}
-	if len(data) > MaxFrameSize {
-		return nil, &FrameTooLargeError{Size: len(data), Max: MaxFrameSize}
+	if err := checkFrameSize(data); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
@@ -430,6 +463,9 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 	defer c.endWork()
 
 	// Send the request.
+	if c.onDispatch != nil {
+		c.onDispatch()
+	}
 	if err := c.sendAndWait(ctx, env); err != nil {
 		return nil, err
 	}
@@ -445,6 +481,7 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 		defer inactivityTimer.Stop()
 	}
 	// Wait for response or meaningful request activity.
+	cancelled := ctx.Done()
 	for {
 		select {
 		case resp := <-respCh:
@@ -475,7 +512,7 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 			c.cancelHostCalls(env.ID)
 			_ = c.Send(&Envelope{Type: MsgCancel, ID: env.ID, Cancel: &CancelPayload{RequestID: env.ID, Reason: "handler inactivity"}})
 			return nil, &HandlerStalledError{Extension: c.name, Operation: operation, HeartbeatHealthy: !c.closed.Load()}
-		case <-ctx.Done():
+		case <-cancelled:
 			c.cancelHostCalls(env.ID)
 			_ = c.Send(&Envelope{
 				Type: MsgCancel,
@@ -485,6 +522,12 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 					Reason:    ctx.Err().Error(),
 				},
 			})
+			if env.Request != nil && env.Request.Method == MethodProviderStream && (errors.Is(context.Cause(ctx), context.Canceled) || errors.Is(context.Cause(ctx), context.DeadlineExceeded)) {
+				// Pi forwards the native stream's own terminal event after signaling
+				// abort. The connection still owns liveness and closes on shutdown.
+				cancelled = nil
+				continue
+			}
 			return nil, ctx.Err()
 		}
 	}
@@ -561,9 +604,22 @@ func (c *Conn) Close(reason string) error {
 	c.pendingMu.Unlock()
 
 	if err != nil {
+		c.producerTasks.Wait()
 		return err
 	}
+	c.producerTasks.Wait()
 	return shutdownErr
+}
+
+// startProducerTask admits a stream worker before close and joins it with connection shutdown. Pending requests wake on connection closure, so producer cleanup cannot outlive Close.
+func (c *Conn) startProducerTask(run func()) bool {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.closed.Load() || c.closing.Load() {
+		return false
+	}
+	c.producerTasks.Go(run)
+	return true
 }
 
 // failureError returns the terminal transport or liveness error, if any.
@@ -669,7 +725,7 @@ func (c *Conn) readLoop(ctx context.Context) {
 			}
 			continue
 		}
-		if env.Type == MsgNotify && env.Notify != nil && env.Notify.Method == NotifyToolUpdate {
+		if env.Type == MsgNotify && env.Notify != nil && (env.Notify.Method == NotifyToolUpdate || env.Notify.Method == NotifyProviderStreamEvent) {
 			c.deliverToolUpdate(env.Notify.Args)
 			continue
 		}
@@ -782,22 +838,27 @@ func (c *Conn) deliverToolUpdate(args json.RawMessage) {
 
 func (c *Conn) hostCallContext(parentRequestID, callID string) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	if parentRequestID == "" {
-		return ctx, cancel
-	}
-	c.pendingMu.Lock()
-	_, pending := c.pending[parentRequestID]
-	if !pending {
+	if parentRequestID != "" {
+		c.pendingMu.Lock()
+		_, pending := c.pending[parentRequestID]
+		if !pending {
+			c.pendingMu.Unlock()
+			cancel()
+			return ctx, func() {}
+		}
+		c.hostCallMu.Lock()
 		c.pendingMu.Unlock()
-		cancel()
-		return ctx, func() {}
+	} else {
+		c.hostCallMu.Lock()
 	}
-	c.hostCallMu.Lock()
-	c.pendingMu.Unlock()
-	if _, cancelled := c.cancelledParent[parentRequestID]; cancelled {
+	_, cancelled := c.cancelledParent[parentRequestID]
+	if cancelled || c.closed.Load() {
 		c.hostCallMu.Unlock()
 		cancel()
 		return ctx, func() {}
+	}
+	if callID == "" {
+		callID = fmt.Sprintf("host-%d", c.nextID.Add(1))
 	}
 	calls := c.hostCalls[parentRequestID]
 	if calls == nil {

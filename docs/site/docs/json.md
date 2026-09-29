@@ -10,7 +10,7 @@ Use this mode when one process invocation handles one prompt. Use [RPC mode](/do
 
 ## Framing
 
-Each output record is one JSON object followed by LF (`\n`). PiG writes diagnostics to standard error.
+Each output record is one JSON object followed by LF (`\n`). PiG writes diagnostics to standard error. JSON mode uses the same field ordering and string escaping as the [RPC event encoder](/docs/latest/rpc#framing).
 
 The first output line is the Session header. PiG writes it with `--no-session` too:
 

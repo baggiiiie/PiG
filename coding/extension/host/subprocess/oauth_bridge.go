@@ -228,11 +228,11 @@ func unmarshalOAuthResult(resp *Envelope, out any) error {
 }
 
 func toWireCreds(c ai.OAuthCredentials) OAuthCredentialsWire {
-	return OAuthCredentialsWire{Refresh: c.Refresh, Access: c.Access, Expires: c.Expires, ProjectID: c.ProjectID}
+	return OAuthCredentialsWire{Refresh: c.Refresh, Access: c.Access, Expires: c.Expires, ProjectID: c.ProjectID, AccountID: c.AccountID, Scope: c.Scope}
 }
 
 func fromWireCreds(w OAuthCredentialsWire) ai.OAuthCredentials {
-	return ai.OAuthCredentials{Refresh: w.Refresh, Access: w.Access, Expires: w.Expires, ProjectID: w.ProjectID}
+	return ai.OAuthCredentials{Refresh: w.Refresh, Access: w.Access, Expires: w.Expires, ProjectID: w.ProjectID, AccountID: w.AccountID, Scope: w.Scope}
 }
 
 // registerOAuthProvider inspects a provider's config for an oauth sub-config

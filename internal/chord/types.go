@@ -5,7 +5,7 @@
 //
 // Upstream source: .upstream/v0.87.1/packages/chord/src/{types,api}.ts and
 // services/{state,provider,consumer,instances,wire,errors,loopback}.ts.
-// packages/chord is outside PORT_MAP package scope (see PORT_MAP.md); this
+// packages/chord is outside PORT_MAP package scope (see docs/parity/PORT_MAP.md); this
 // package exists so experimental service lanes share one concrete runtime
 // instead of consumer-owned stand-ins.
 //

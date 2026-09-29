@@ -11,8 +11,9 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"regexp"
 	"strings"
+	"time"
+	"unicode/utf16"
 )
 
 // AnthropicConfig configures the Anthropic Messages API provider.
@@ -24,6 +25,8 @@ type AnthropicConfig struct {
 	APIKey string
 	// Model is the model name sent in the request (e.g. "claude-sonnet-4-20250514").
 	Model string
+	// ModelMetadata retains the caller-selected model's capabilities and API metadata instead of resolving an ID through the catalog.
+	ModelMetadata *Model
 	// ProviderID is the provider label (default: "anthropic").
 	ProviderID string
 	// BaseURL is the API base (default: https://api.anthropic.com).
@@ -107,7 +110,12 @@ type anthRequest struct {
 	// Mirrors upstream anthropic.ts output_config.
 	OutputConfig *anthOutputConfig `json:"output_config,omitempty"`
 	// Temperature is incompatible with extended thinking.
-	Temperature *float64 `json:"temperature,omitempty"`
+	Temperature *float64       `json:"temperature,omitempty"`
+	Fallbacks   []anthFallback `json:"fallbacks,omitempty"`
+}
+
+type anthFallback struct {
+	Model string `json:"model"`
 }
 
 type anthMetadata struct {
@@ -162,6 +170,27 @@ type anthContentBlock struct {
 	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
+// Text and thinking blocks retain their required string fields, including explicit empty values.
+func (block anthContentBlock) MarshalJSON() ([]byte, error) {
+	type payload anthContentBlock
+	if block.Type == "text" {
+		return json.Marshal(struct {
+			payload
+			Text string `json:"text"`
+		}{payload: payload(block), Text: block.Text})
+	}
+	if block.Type != "thinking" {
+		return json.Marshal(payload(block))
+	}
+	// upstream: packages/ai/src/api/anthropic-messages.ts:convertMessages retains empty thinking and signature fields on thinking blocks.
+	return json.Marshal(struct {
+		Type         string            `json:"type"`
+		Thinking     string            `json:"thinking"`
+		Signature    string            `json:"signature"`
+		CacheControl *anthCacheControl `json:"cache_control,omitempty"`
+	}{block.Type, block.Thinking, block.Signature, block.CacheControl})
+}
+
 // anthToolReference names a declared tool in a tool_addition or tool_removal
 // block.
 type anthToolReference struct {
@@ -199,9 +228,10 @@ func deferredToolPlaceholder() anthTool {
 
 type anthEventMessageStart struct {
 	Message struct {
-		ID    string `json:"id"`
-		Model string `json:"model"`
-		Usage struct {
+		ID                   string `json:"id"`
+		Model                string `json:"model"`
+		InputTransformations any    `json:"input_transformations"`
+		Usage                struct {
 			InputTokens              int `json:"input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
@@ -219,12 +249,14 @@ type anthEventMessageStart struct {
 type anthEventContentBlockStart struct {
 	Index        int `json:"index"`
 	ContentBlock struct {
-		Type  string `json:"type"` // "text" | "thinking" | "redacted_thinking" | "tool_use"
-		ID    string `json:"id,omitempty"`
-		Name  string `json:"name,omitempty"`
-		Text  string `json:"text,omitempty"`
-		Input any    `json:"input,omitempty"`
-		Data  string `json:"data,omitempty"` // redacted_thinking
+		Type      string `json:"type"` // "text" | "thinking" | "redacted_thinking" | "tool_use"
+		ID        string `json:"id,omitempty"`
+		Name      string `json:"name,omitempty"`
+		Text      string `json:"text,omitempty"`
+		Thinking  string `json:"thinking,omitempty"`
+		Signature string `json:"signature,omitempty"`
+		Input     any    `json:"input,omitempty"`
+		Data      string `json:"data,omitempty"` // redacted_thinking
 	} `json:"content_block"`
 }
 
@@ -244,7 +276,8 @@ type anthEventContentBlockStop struct {
 }
 
 type anthEventMessageDelta struct {
-	Delta struct {
+	InputTransformations any `json:"input_transformations"`
+	Delta                struct {
 		StopReason  string `json:"stop_reason"`
 		StopDetails *struct {
 			Type        string `json:"type"`
@@ -272,59 +305,66 @@ type anthErrorResponse struct {
 
 // ─── Message conversion ──────────────────────────────────────────────────────
 
-// anthToolCallIDRe matches characters NOT in the Anthropic allowed set.
-// Anthropic requires tool_use_id to match ^[a-zA-Z0-9_-]+$ (max 64 chars).
-// Cross-provider IDs (e.g. OpenAI Responses "call_xxx|item_xxx") must be
-// normalized before sending to the Anthropic Messages API.
-// Mirrors upstream anthropic.ts normalizeToolCallId.
-var anthToolCallIDRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
-
+// normalizeAnthropicToolCallID replaces non-ASCII identifier characters per UTF-16 code unit, then truncates the ASCII result to Anthropic's 64-unit limit.
+// upstream: packages/ai/src/api/anthropic-messages.ts:normalizeToolCallId
 func normalizeAnthropicToolCallID(id string) string {
-	normalized := anthToolCallIDRe.ReplaceAllString(id, "_")
-	if len(normalized) > 64 {
-		normalized = normalized[:64]
+	var normalized [64]byte
+	length := 0
+	for _, r := range id {
+		if length == len(normalized) {
+			break
+		}
+		value := byte('_')
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			value = byte(r)
+		}
+		normalized[length] = value
+		length++
+		if utf16.RuneLen(r) == 2 && length < len(normalized) {
+			normalized[length] = '_'
+			length++
+		}
 	}
-	return normalized
+	return string(normalized[:length])
 }
 
-// anthToolResultContent mirrors upstream convertContentBlocks (pi-ai
-// anthropic.ts): a tool result's content is a plain string when there are no
-// images, otherwise an array of text+image blocks. Anthropic requires image
-// blocks to use the "source" base64 shape. The prior code dropped b.Images
-// entirely, so read-tool image output never reached the model: it saw only
-// the "[Image: ...]" placeholder text.
+// anthToolResultContent joins every text-only element with a newline. Mixed text/image results preserve block order and explicit empty text; only an image-only result receives placeholder text.
 func anthToolResultContent(content []ToolResultMessageContent) any {
-	var text strings.Builder
-	var images []ImageContent
+	hasImages := false
+	for _, block := range content {
+		if _, ok := block.(ImageContent); ok {
+			hasImages = true
+			break
+		}
+	}
+	if !hasImages {
+		var text strings.Builder
+		for index, block := range content {
+			if index > 0 {
+				text.WriteByte('\n')
+			}
+			text.WriteString(block.(TextContent).Text)
+		}
+		return sanitizeSurrogates(text.String())
+	}
+	blocks := make([]anthContentBlock, 0, len(content))
+	hasText := false
 	for _, block := range content {
 		switch block := block.(type) {
 		case TextContent:
-			if text.Len() > 0 {
-				text.WriteByte('\n')
-			}
-			text.WriteString(block.Text)
+			hasText = true
+			blocks = append(blocks, anthContentBlock{Type: "text", Text: sanitizeSurrogates(block.Text)})
 		case ImageContent:
-			images = append(images, block)
+			blocks = append(blocks, anthContentBlock{
+				Type: "image",
+				Source: map[string]any{
+					"type": "base64", "media_type": block.MimeType, "data": block.Data,
+				},
+			})
 		}
 	}
-	if len(images) == 0 {
-		return text.String()
-	}
-	blocks := make([]anthContentBlock, 0, 1+len(images))
-	if strings.TrimSpace(text.String()) != "" {
-		blocks = append(blocks, anthContentBlock{Type: "text", Text: text.String()})
-	} else {
-		blocks = append(blocks, anthContentBlock{Type: "text", Text: "(see attached image)"})
-	}
-	for _, image := range images {
-		blocks = append(blocks, anthContentBlock{
-			Type: "image",
-			Source: map[string]any{
-				"type":       "base64",
-				"media_type": image.MimeType,
-				"data":       image.Data,
-			},
-		})
+	if !hasText {
+		blocks = append([]anthContentBlock{{Type: "text", Text: "(see attached image)"}}, blocks...)
 	}
 	return blocks
 }
@@ -359,7 +399,7 @@ func applyConversationCacheControl(msgs []anthMessage, cc *anthCacheControl) {
 func anthSystemUpdateBlocks(message SystemMessage, isOAuthToken, nativeToolChanges bool) []anthContentBlock {
 	var blocks []anthContentBlock
 	if update := RenderSystemMessageUpdate(message); update != "" {
-		blocks = append(blocks, anthContentBlock{Type: "text", Text: update})
+		blocks = append(blocks, anthContentBlock{Type: "text", Text: sanitizeSurrogates(update)})
 	}
 	if !nativeToolChanges {
 		return blocks
@@ -392,8 +432,7 @@ func anthConvertMessages(messages []Message, isOAuthToken, allowEmptySignature, 
 	return anthConvertMessagesDetailed(messages, isOAuthToken, allowEmptySignature, "", nativeToolChanges).messages
 }
 
-// anthConvertMessagesDetailed also records native effort for replayable
-// assistant turns when the managed-effort provider identity matches.
+// anthConvertMessagesDetailed also records native effort for replayable assistant turns when the managed-effort provider identity matches. Empty text and signature checks use ECMAScript whitespace rules.
 func anthConvertMessagesDetailed(messages []Message, isOAuthToken, allowEmptySignature bool, managedProvider string, nativeToolChanges bool) anthConvertedMessages {
 	out := make([]anthMessage, 0, len(messages))
 	assistantLevels := map[int]string{}
@@ -407,16 +446,17 @@ func anthConvertMessagesDetailed(messages []Message, isOAuthToken, allowEmptySig
 		case UserMessage:
 			switch content := message.Content.(type) {
 			case UserText:
-				if strings.TrimSpace(string(content)) != "" {
-					out = append(out, anthMessage{Role: "user", Content: string(content)})
+				if trimJSWhitespace(string(content)) != "" {
+					out = append(out, anthMessage{Role: "user", Content: sanitizeSurrogates(string(content))})
 				}
 			case UserContentBlocks:
 				var blocks []anthContentBlock
 				for _, content := range content {
 					switch content := content.(type) {
 					case TextContent:
-						if strings.TrimSpace(content.Text) != "" {
-							blocks = append(blocks, anthContentBlock{Type: "text", Text: content.Text})
+						// Pi sanitizes each user text block before its blank filter.
+						if text := sanitizeSurrogates(content.Text); trimJSWhitespace(text) != "" {
+							blocks = append(blocks, anthContentBlock{Type: "text", Text: text})
 						}
 					case ImageContent:
 						blocks = append(blocks, anthContentBlock{Type: "image", Source: map[string]any{
@@ -435,22 +475,26 @@ func anthConvertMessagesDetailed(messages []Message, isOAuthToken, allowEmptySig
 			for _, content := range message.Content {
 				switch content := content.(type) {
 				case TextContent:
-					if strings.TrimSpace(content.Text) != "" {
-						blocks = append(blocks, anthContentBlock{Type: "text", Text: content.Text})
+					if trimJSWhitespace(content.Text) != "" {
+						blocks = append(blocks, anthContentBlock{Type: "text", Text: sanitizeSurrogates(content.Text)})
 					}
 				case ThinkingContent:
 					if content.Redacted {
 						blocks = append(blocks, anthContentBlock{Type: "redacted_thinking", Data: content.ThinkingSignature})
 						continue
 					}
-					signature := strings.TrimSpace(content.ThinkingSignature)
-					if strings.TrimSpace(content.Thinking) == "" && signature == "" {
+					signature := trimJSWhitespace(content.ThinkingSignature)
+					if trimJSWhitespace(content.Thinking) == "" && signature == "" {
 						continue
 					}
 					if signature != "" || allowEmptySignature {
-						blocks = append(blocks, anthContentBlock{Type: "thinking", Thinking: content.Thinking, Signature: content.ThinkingSignature})
+						wireSignature := content.ThinkingSignature
+						if signature == "" {
+							wireSignature = ""
+						}
+						blocks = append(blocks, anthContentBlock{Type: "thinking", Thinking: sanitizeSurrogates(content.Thinking), Signature: wireSignature})
 					} else {
-						blocks = append(blocks, anthContentBlock{Type: "text", Text: content.Thinking})
+						blocks = append(blocks, anthContentBlock{Type: "text", Text: sanitizeSurrogates(content.Thinking)})
 					}
 				case ToolCall:
 					arguments := content.Arguments
@@ -701,26 +745,23 @@ func thinkingToAnthropicConfig(model *Model, maxTokens int, level ThinkingLevel)
 	if level == "" {
 		return nil
 	}
-	clamped := ClampThinkingLevel(model, level)
-	switch clamped {
-	case ThinkingOff, "":
-		return nil
-	}
-
-	// Adaptive thinking: model.compat.forceAdaptiveThinking == true.
-	// Mirrors upstream: params.thinking = {type: "adaptive", display: "summarized"}
-	// with optional output_config = {effort: level}.
+	// upstream: packages/ai/src/api/anthropic-messages.ts:streamSimple
+	// Adaptive effort maps the requested level directly; only budget-based thinking is clamped.
 	if modelUsesAdaptiveThinking(model) {
 		result := &anthThinkingResult{
 			Thinking: &anthThinking{Type: "adaptive", Display: "summarized"},
 		}
-		effort := mapThinkingLevelToEffort(model, clamped)
+		effort := mapThinkingLevelToEffort(model, level)
 		if effort != "" {
 			result.OutputConfig = &anthOutputConfig{Effort: effort}
 		}
 		return result
 	}
 
+	clamped := ClampThinkingLevel(model, level)
+	if clamped == ThinkingOff || clamped == "" {
+		return nil
+	}
 	// Budget-based thinking for older models.
 	// Mirrors upstream adjustMaxTokensForThinking (simple-options.ts:26-53).
 	// Default budgets by level match upstream defaultBudgets.
@@ -748,6 +789,10 @@ func thinkingToAnthropicConfig(model *Model, maxTokens int, level ThinkingLevel)
 	adjustedMax := min(maxTokens+budget, modelMax)
 	if adjustedMax <= budget {
 		budget = max(0, adjustedMax-1024)
+	}
+	// upstream: packages/ai/src/api/anthropic-messages.ts:buildParams applies thinkingBudgetTokens || 1024 after simple-option lowering.
+	if budget == 0 {
+		budget = 1024
 	}
 
 	return &anthThinkingResult{
@@ -792,19 +837,36 @@ func (params anthropicParams) convertMessages(messages []Message, isOAuthToken b
 	return converted.messages
 }
 
+// Stream retains the assistant identity and active effort when request preparation fails, and terminates with an error event before generation starts.
 func (p *anthropicProvider) Stream(ctx context.Context, transcript TranscriptContext, opts StreamOptions) (*AssistantMessageEventStream, error) {
+	ctx = withProviderRequestOptions(ctx, opts)
 	if err := validateProviderRequest(ctx, transcript); err != nil {
 		return nil, fmt.Errorf("anthropic: invalid transcript: %w", err)
 	}
 	model := p.resolveModel()
+	// upstream: packages/ai/src/api/anthropic-messages.ts:stream
+	builder := newAssistantStreamBuilder(ctx, APIAnthropicMessages, p.cfg.ProviderID, p.cfg.Model)
+	builder.modelCost = opts.ModelCost
+	builder.setResponseMetadata("", "", "", anthropicProviderEffort(model, opts), nil)
+	if err := p.startStream(ctx, transcript, opts, model, builder); err != nil {
+		reason := StopReasonError
+		if ctx.Err() != nil {
+			reason = StopReasonAborted
+		}
+		builder.fail(reason, err)
+	}
+	return builder.stream, nil
+}
+
+func (p *anthropicProvider) startStream(ctx context.Context, transcript TranscriptContext, opts StreamOptions, model *Model, builder *assistantStreamBuilder) error {
 	baseURL, apiKey, err := p.resolveEndpoint(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	requestEnv := mergeProviderEnv(p.cfg.Env, opts.Env)
 	baseURL, err = ResolveCloudflareBaseURL(p.cfg.ProviderID, baseURL, requestEnv)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	modelHeaders := anthropicHeadersFromMap(p.cfg.ExtraHeaders)
 	// Upstream Models.applyAuth passes resolved auth headers, then model
@@ -814,18 +876,18 @@ func (p *anthropicProvider) Stream(ctx context.Context, transcript TranscriptCon
 	if p.cfg.UseBearerAuth && p.cfg.DynamicHeaders != nil {
 		dynamicHeaders = anthropicHeadersFromMap(p.cfg.DynamicHeaders(transcript, opts))
 	}
-	client := p.createClient(apiKey, optionsHeaders, dynamicHeaders, p.sessionAffinityHeaders(opts.SessionID, requestEnv))
+	client := p.createClient(apiKey, optionsHeaders, dynamicHeaders, p.sessionAffinityHeaders(opts.SessionID, resolveAnthropicCacheRetention(opts.CacheRetention, requestEnv)))
 	params, err := p.buildParams(model, transcript, client.isOAuthToken, modelHeaders, optionsHeaders, opts, requestEnv)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: build params: %w", err)
+		return fmt.Errorf("anthropic: build params: %w", err)
 	}
 
 	sendOnce := func() (*http.Response, error) {
-		return p.send(ctx, baseURL, client, params.request, opts)
+		return p.send(ctx, baseURL, client, params.request, model, opts)
 	}
 	resp, err := sendOnce() //nolint:bodyclose // closed on the error paths below and via defer in the SSE goroutine on success
 	if err != nil {
-		return nil, fmt.Errorf(p.cfg.ProviderID+": request: %w", err)
+		return err
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -835,40 +897,53 @@ func (p *anthropicProvider) Stream(ctx context.Context, transcript TranscriptCon
 			params.request.Messages = params.convertMessages(stripThinkingSignatures(params.conversation), client.isOAuthToken)
 			resp, err = sendOnce() //nolint:bodyclose // closed just below on non-200 and via defer in the SSE goroutine on success
 			if err != nil {
-				return nil, fmt.Errorf(p.cfg.ProviderID+": request: %w", err)
+				return err
 			}
 			if resp.StatusCode != http.StatusOK {
 				b2, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				return nil, anthHTTPError(p.cfg.ProviderID, resp.StatusCode, b2)
+				return anthHTTPError(p.cfg.ProviderID, resp.StatusCode, b2)
 			}
 		} else {
-			return nil, anthHTTPError(p.cfg.ProviderID, resp.StatusCode, b)
+			return anthHTTPError(p.cfg.ProviderID, resp.StatusCode, b)
 		}
 	}
 
-	builder := newAssistantStreamBuilder(ctx, APIAnthropicMessages, p.cfg.ProviderID, p.cfg.Model)
-	builder.modelCost = opts.ModelCost
-	if params.activeEffort != "" {
-		builder.setResponseMetadata("", "", "", params.activeEffort, nil)
+	if err := observeProviderResponse(ctx, opts, resp, model); err != nil {
+		_ = resp.Body.Close()
+		return err
 	}
 	go func() {
 		defer func() { _ = resp.Body.Close() }()
 		p.parseAnthropicSSE(ctx, resp.Body, builder, anthropicStreamNames{isOAuthToken: client.isOAuthToken, currentTools: params.tools})
 	}()
-	return builder.stream, nil
+	return nil
+}
+
+func anthropicProviderEffort(model *Model, opts StreamOptions) string {
+	if !anthropicCompatFlag(model, func(c *ModelCompat) *bool { return c.SupportsMidConvoEffort }) {
+		return ""
+	}
+	if opts.Effort != "" {
+		return opts.Effort
+	}
+	return anthropicActiveEffort(model, opts.Thinking)
 }
 
 func (p *anthropicProvider) resolveModel() *Model {
 	model := &Model{ID: p.cfg.Model}
-	if generated, ok := LookupModel(p.ID() + "/" + p.cfg.Model); ok {
+	// upstream: packages/ai/src/api/anthropic-messages.ts:buildParams
+	if p.cfg.ModelMetadata != nil {
+		model = new(*p.cfg.ModelMetadata)
+	} else if generated, ok := LookupModel(p.ID() + "/" + p.cfg.Model); ok {
 		model = generated.ToModel()
 	}
-	// Apply config-level compat to the model when the generated registry
-	// had none (custom/proxy providers, test mode).
-	if model.ProviderMeta.Compat == nil && p.cfg.Compat != nil {
+	// Configured model compat is already merged by the model runtime and takes precedence over the generated catalog.
+	if p.cfg.Compat != nil {
 		model.ProviderMeta.Compat = p.cfg.Compat
 	}
+	model.ProviderMeta.ProviderID = p.cfg.ProviderID
+	model.ProviderMeta.API = APIAnthropicMessages
 	return model
 }
 
@@ -917,28 +992,50 @@ func (p *anthropicProvider) resolveEndpoint(ctx context.Context) (string, string
 
 // sessionAffinityHeaders returns the session affinity header for providers that
 // accept one while prompt caching is enabled.
-func (p *anthropicProvider) sessionAffinityHeaders(sessionID string, env ProviderEnv) anthropicHeaders {
+func (p *anthropicProvider) sessionAffinityHeaders(sessionID string, retention CacheRetention) anthropicHeaders {
 	var headers anthropicHeaders
-	if sessionID == "" || getProviderEnvValue("PI_CACHE_RETENTION", env) == "none" {
+	if sessionID == "" || retention == CacheRetentionNone {
 		return headers
 	}
-	sendSessionAffinity := false
-	if compat := p.cfg.Compat; compat != nil && compat.SendSessionAffinityHeaders != nil {
-		sendSessionAffinity = *compat.SendSessionAffinityHeaders
-	} else if p.cfg.ProviderID == "fireworks" || (p.cfg.ProviderID == "cloudflare-ai-gateway" && strings.Contains(p.cfg.BaseURL, "anthropic")) {
-		sendSessionAffinity = true
+	// upstream: packages/ai/src/api/anthropic-messages.ts:getAnthropicCompat
+	isOpenRouter := p.cfg.ProviderID == "openrouter" || strings.Contains(p.cfg.BaseURL, "openrouter.ai")
+	sendSessionAffinity := isOpenRouter
+	format := SessionAffinityFormat("")
+	if isOpenRouter {
+		format = SessionAffinityOpenRouter
+	}
+	if compat := p.cfg.Compat; compat != nil {
+		if compat.SendSessionAffinityHeaders != nil {
+			sendSessionAffinity = *compat.SendSessionAffinityHeaders
+		}
+		if compat.SessionAffinityFormat != "" {
+			format = compat.SessionAffinityFormat
+		}
 	}
 	if sendSessionAffinity {
-		headers.set("x-session-affinity", sessionID)
+		header := "x-session-affinity"
+		if format == SessionAffinityOpenRouter {
+			header = "x-session-id"
+		}
+		headers.set(header, sessionID)
 	}
 	return headers
 }
 
-// cacheControl mirrors upstream getCacheControl: the breakpoint applies to the
-// system prompt, tools, and conversation history.
-func (p *anthropicProvider) cacheControl(env ProviderEnv) *anthCacheControl {
-	cacheRetention := getProviderEnvValue("PI_CACHE_RETENTION", env)
-	if cacheRetention == "none" {
+// resolveAnthropicCacheRetention gives explicit request choices precedence; only env=long changes the short default.
+func resolveAnthropicCacheRetention(retention CacheRetention, env ProviderEnv) CacheRetention {
+	if retention != "" {
+		return retention
+	}
+	if getProviderEnvValue("PI_CACHE_RETENTION", env) == "long" {
+		return CacheRetentionLong
+	}
+	return CacheRetentionShort
+}
+
+// cacheControl applies the resolved retention to system, tool, and conversation breakpoints.
+func (p *anthropicProvider) cacheControl(retention CacheRetention) *anthCacheControl {
+	if retention == CacheRetentionNone {
 		return nil
 	}
 	cc := &anthCacheControl{Type: "ephemeral"}
@@ -946,7 +1043,7 @@ func (p *anthropicProvider) cacheControl(env ProviderEnv) *anthCacheControl {
 	if compat := p.cfg.Compat; compat != nil && compat.SupportsLongCacheRetention != nil {
 		supportsLong = *compat.SupportsLongCacheRetention
 	}
-	if cacheRetention == "long" && supportsLong {
+	if retention == CacheRetentionLong && supportsLong {
 		cc.TTL = "1h"
 	}
 	return cc
@@ -968,7 +1065,7 @@ func anthSystemBlocks(systemPrompt string, isOAuthToken bool, cc *anthCacheContr
 		blocks = append(blocks, anthSystemBlock{Type: "text", Text: claudeCodeSystemPrompt, CacheControl: cc})
 	}
 	if systemPrompt != "" {
-		blocks = append(blocks, anthSystemBlock{Type: "text", Text: systemPrompt, CacheControl: cc})
+		blocks = append(blocks, anthSystemBlock{Type: "text", Text: sanitizeSurrogates(systemPrompt), CacheControl: cc})
 	}
 	return blocks
 }
@@ -1024,7 +1121,10 @@ func anthropicRequestTools(messages []Message, params anthropicParams, initialTo
 // buildParams mirrors upstream buildParams for the request fields PiG sends.
 func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptContext, isOAuthToken bool, modelHeaders, optionsHeaders anthropicHeaders, opts StreamOptions, env ProviderEnv) (anthropicParams, error) {
 	supportsMidConversation := anthropicCompatFlag(model, func(c *ModelCompat) *bool { return c.SupportsMidConvoSystemMessages })
-	messages := ResolveTranscript(transcript, supportsMidConversation).Messages()
+	// upstream: packages/ai/src/api/anthropic-messages.ts:buildParams
+	messages := TransformMessages(ResolveTranscript(transcript, supportsMidConversation).Messages(), model, func(id string, _ *Model, _ AssistantMessage) string {
+		return normalizeAnthropicToolCallID(id)
+	})
 	systemPrompt := ""
 	var initialTools []ToolSchema
 	if initialSystem := GetInitialSystemMessage(messages); initialSystem != nil {
@@ -1037,15 +1137,15 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 	params := anthropicParams{
 		conversation:        WithoutInitialSystemMessage(messages),
 		tools:               GetCurrentTools(messages),
-		cacheControl:        p.cacheControl(env),
+		cacheControl:        p.cacheControl(resolveAnthropicCacheRetention(opts.CacheRetention, env)),
 		allowEmptySignature: modelAllowsEmptySignature(model),
 		nativeToolChanges: supportsMidConversation &&
 			anthropicCompatFlag(model, func(c *ModelCompat) *bool { return c.SupportsMidConvoToolChanges }) &&
 			len(initialTools) > 0 && !HasToolRedefinitions(messages),
 	}
-	if anthropicCompatFlag(model, func(c *ModelCompat) *bool { return c.SupportsMidConvoEffort }) {
+	params.activeEffort = anthropicProviderEffort(model, opts)
+	if params.activeEffort != "" {
 		params.managedProvider = p.cfg.ProviderID
-		params.activeEffort = anthropicActiveEffort(model, opts.Thinking)
 	}
 	maxTokens := opts.MaxTokens
 	if maxTokens <= 0 {
@@ -1057,6 +1157,13 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 	}
 	supportsEager := p.supportsEagerToolInputStreaming()
 	thinkingEnabled := opts.Thinking != ThinkingOff && opts.Thinking != ""
+	if opts.ThinkingEnabled != nil {
+		thinkingEnabled = *opts.ThinkingEnabled
+	}
+	var allowedFallbackModels []AnthropicAllowedFallbackModel
+	if compat := model.ProviderMeta.Compat; compat != nil {
+		allowedFallbackModels = compat.AllowedFallbackModels
+	}
 	req := anthRequest{
 		Model:     p.cfg.Model,
 		Messages:  params.convertMessages(params.conversation, isOAuthToken),
@@ -1069,10 +1176,17 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 			reasoning:                       model.ProviderMeta.Reasoning,
 			thinkingEnabled:                 thinkingEnabled,
 			forceAdaptiveThinking:           modelUsesAdaptiveThinking(model),
+			hasFallbacks:                    len(allowedFallbackModels) > 0,
 			supportsMidConvoEffort:          params.activeEffort != "",
 			nativeToolChanges:               params.nativeToolChanges,
 		}),
 		System: anthSystemBlocks(systemPrompt, isOAuthToken, params.cacheControl),
+	}
+	if len(allowedFallbackModels) > 0 {
+		req.Fallbacks = make([]anthFallback, len(allowedFallbackModels))
+		for i, fallback := range allowedFallbackModels {
+			req.Fallbacks[i].Model = fallback.Model
+		}
 	}
 	var toolCacheControl *anthCacheControl
 	if compat := p.cfg.Compat; compat == nil || compat.SupportsCacheControlOnTools == nil || *compat.SupportsCacheControlOnTools {
@@ -1093,6 +1207,25 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 		req.Metadata = &anthMetadata{UserID: userID}
 	}
 	p.applySampling(&req, model, maxTokens, thinkingEnabled, opts.Thinking, opts.Temperature, opts.TemperatureSet || opts.Temperature != 0, params.activeEffort != "")
+	if opts.ThinkingEnabled != nil && model.ProviderMeta.Reasoning && params.activeEffort == "" {
+		req.Thinking, req.OutputConfig, req.MaxTokens = nil, nil, maxTokens
+		if *opts.ThinkingEnabled {
+			if modelUsesAdaptiveThinking(model) {
+				req.Thinking = &anthThinking{Type: "adaptive", Display: "summarized"}
+				if opts.Effort != "" {
+					req.OutputConfig = &anthOutputConfig{Effort: opts.Effort}
+				}
+			} else {
+				budget := 1024
+				if opts.ThinkingBudgetTokens != nil && *opts.ThinkingBudgetTokens != 0 {
+					budget = *opts.ThinkingBudgetTokens
+				}
+				req.Thinking = &anthThinking{Type: "enabled", BudgetTokens: budget, Display: "summarized"}
+			}
+		} else if !anthThinkingOffIsNull(model) {
+			req.Thinking = &anthThinking{Type: "disabled"}
+		}
+	}
 	params.request = req
 	return params, nil
 }
@@ -1131,13 +1264,13 @@ func (p *anthropicProvider) applySampling(req *anthRequest, model *Model, maxTok
 	req.Temperature = new(temperature)
 }
 
-// send runs OnPayload on the current request, then issues the streaming POST.
-func (p *anthropicProvider) send(ctx context.Context, baseURL string, client anthropicClient, req anthRequest, opts StreamOptions) (*http.Response, error) {
+// send runs OnPayload with the selected model and current request, then issues the streaming POST.
+func (p *anthropicProvider) send(ctx context.Context, baseURL string, client anthropicClient, req anthRequest, model *Model, opts StreamOptions) (*http.Response, error) {
 	payload := any(req)
 	if opts.OnPayload != nil {
-		next, err := opts.OnPayload(req, &Model{ID: p.cfg.Model, ProviderMeta: ProviderMetadata{ProviderID: p.cfg.ProviderID}})
+		next, err := opts.OnPayload(req, model)
 		if err != nil {
-			return nil, fmt.Errorf(p.cfg.ProviderID+": onPayload: %w", err)
+			return nil, err
 		}
 		if next != nil {
 			payload = next
@@ -1158,7 +1291,21 @@ func (p *anthropicProvider) send(ctx context.Context, baseURL string, client ant
 		return nil, err
 	}
 	applyAnthropicRequestHeaders(httpReq, client, betas)
-	return p.client.Do(httpReq)
+	response, err := providerHTTPClient(p.client, opts.Fetch).Do(httpReq)
+	if err != nil {
+		// Upstream retryProviderRequest preserves cancellation, while the Anthropic SDK classifies pre-header transport failures before stream's catch publishes them.
+		switch {
+		case ctx.Err() != nil:
+			return nil, errors.New("Request aborted")
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, errors.New("Request timed out.")
+		default:
+			if _, ok := errors.AsType[*nodeTransportError](err); ok {
+				return nil, errors.New("Connection error.")
+			}
+		}
+	}
+	return response, err
 }
 
 // ─── SSE parsing ─────────────────────────────────────────────────────────────
@@ -1184,16 +1331,17 @@ func unmarshalAnthropicSSEEvent(event serverSentEvent, target any) error {
 	return nil
 }
 
+// parseAnthropicSSE emits start before provider metadata, routes blocks by provider index and content type, and finalizes only after iterator EOF. Error-event data is surfaced verbatim.
 func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, builder *assistantStreamBuilder, names anthropicStreamNames) {
+	builder.start()
 	// Track active blocks by their Anthropic index.
 	type activeBlock struct {
-		blockType string // "text" | "thinking" | "tool_use"
-		redacted  bool   // true for redacted_thinking
-		seqIdx    int    // 0-based sequential tool call index
-		toolID    string
-		toolName  string
-		toolArgs  strings.Builder
-		signature strings.Builder
+		blockType    string // "text" | "thinking" | "tool_use"
+		contentIndex int    // index in the assistant's complete content array
+		seqIdx       int    // 0-based sequential tool call index
+		toolID       string
+		toolName     string
+		signature    strings.Builder
 	}
 	blocks := map[int]*activeBlock{}
 	toolCallSeqIdx := 0 // 0-based sequential index for tool calls only
@@ -1203,7 +1351,9 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 	usageCost := builder.modelCost
 	var stopReason StopReason // provider-reported stop reason
 	var errMsg string         // refusal explanation, surfaced on EventDone (#5666)
+	var inputTransformations []any
 	sawMessageStart := false
+	sawMessageStop := false
 
 	decoder := newSSEDecoder(r)
 
@@ -1220,7 +1370,7 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 			continue
 		}
 		if currentEvent == "error" {
-			builder.fail(StopReasonError, fmt.Errorf("anthropic SSE error: %s", data))
+			builder.fail(StopReasonError, errors.New(data))
 			return
 		}
 
@@ -1231,6 +1381,9 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 			if err := unmarshalAnthropicSSEEvent(event, &ev); err != nil {
 				builder.fail(StopReasonError, err)
 				return
+			}
+			if transformations, ok := ev.Message.InputTransformations.([]any); ok {
+				inputTransformations = transformations
 			}
 			responseModel := ""
 			if ev.Message.Model != p.cfg.Model {
@@ -1259,26 +1412,40 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 				builder.fail(StopReasonError, err)
 				return
 			}
+			if ev.ContentBlock.Type == "fallback" {
+				if len(builder.partial.Content) > 0 {
+					builder.fail(StopReasonError, errors.New("Anthropic performed an unsupported mid-output model fallback"))
+					return
+				}
+				continue
+			}
 			ab := &activeBlock{blockType: ev.ContentBlock.Type}
 			blocks[ev.Index] = ab
 
 			switch ev.ContentBlock.Type {
 			case "text":
-				builder.textStart()
+				ab.contentIndex = builder.textBlockStartWithContent(ev.ContentBlock.Text)
 			case "thinking":
-				builder.thinkingStart(false, "", "")
+				ab.signature.WriteString(ev.ContentBlock.Signature)
+				ab.contentIndex = builder.thinkingBlockStartWithContent(ThinkingContent{
+					Thinking: ev.ContentBlock.Thinking, ThinkingSignature: ev.ContentBlock.Signature,
+					thinkingSignatureEmpty: ev.ContentBlock.Signature == "",
+				})
 			case "redacted_thinking":
 				ab.blockType = "thinking"
-				ab.redacted = true
 				ab.signature.WriteString(ev.ContentBlock.Data)
-				builder.thinkingStart(true, "[Reasoning redacted]", ev.ContentBlock.Data)
+				ab.contentIndex = builder.thinkingBlockStartWithContent(ThinkingContent{
+					Thinking: "[Reasoning redacted]", ThinkingSignature: ev.ContentBlock.Data, Redacted: true,
+					thinkingSignatureEmpty: ev.ContentBlock.Data == "",
+				})
 			case "tool_use":
 				ab.toolID = ev.ContentBlock.ID
 				ab.toolName = names.toolName(ev.ContentBlock.Name)
 				idx := toolCallSeqIdx
 				toolCallSeqIdx++
 				ab.seqIdx = idx
-				builder.toolCallStart(streamToolCallDelta{index: idx, id: ab.toolID, name: ab.toolName})
+				initialArguments, _ := ev.ContentBlock.Input.(map[string]any)
+				builder.toolCallStart(streamToolCallDelta{index: idx, id: ab.toolID, name: ab.toolName, initialArguments: initialArguments})
 			}
 
 		case "content_block_delta":
@@ -1293,17 +1460,24 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 			}
 			switch ev.Delta.Type {
 			case "text_delta":
-				builder.textDelta(ev.Delta.Text)
+				if ab.blockType == "text" {
+					builder.textBlockDelta(ab.contentIndex, ev.Delta.Text)
+				}
 			case "thinking_delta":
-				builder.thinkingDelta(ev.Delta.Thinking, false)
+				if ab.blockType == "thinking" {
+					builder.thinkingBlockDelta(ab.contentIndex, ev.Delta.Thinking)
+				}
 			case "input_json_delta":
-				ab.toolArgs.WriteString(ev.Delta.PartialJSON)
-				builder.toolCallDelta(streamToolCallDelta{
-					index: ab.seqIdx, id: ab.toolID, name: ab.toolName, argumentsDelta: ev.Delta.PartialJSON,
-				})
+				if ab.blockType == "tool_use" {
+					builder.toolCallDelta(streamToolCallDelta{
+						index: ab.seqIdx, id: ab.toolID, name: ab.toolName, argumentsDelta: ev.Delta.PartialJSON,
+					})
+				}
 			case "signature_delta":
-				ab.signature.WriteString(ev.Delta.Signature)
-				builder.thinkingSignature(ab.signature.String())
+				if ab.blockType == "thinking" {
+					ab.signature.WriteString(ev.Delta.Signature)
+					builder.thinkingBlockSignature(ab.contentIndex, ab.signature.String())
+				}
 			}
 
 		case "content_block_stop":
@@ -1318,10 +1492,11 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 			}
 			switch ab.blockType {
 			case "text":
-				builder.endText()
+				block := builder.partial.Content[ab.contentIndex].(TextContent)
+				builder.textBlockEnd(ab.contentIndex, block.Text, block.TextSignature)
 			case "thinking":
-				builder.thinkingSignature(ab.signature.String())
-				builder.endThinking()
+				block := builder.partial.Content[ab.contentIndex].(ThinkingContent)
+				builder.thinkingBlockEnd(ab.contentIndex, block.Thinking, ab.signature.String())
 			case "tool_use":
 				builder.endToolCall(ab.seqIdx)
 			}
@@ -1332,6 +1507,9 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 			if err := unmarshalAnthropicSSEEvent(event, &ev); err != nil {
 				builder.fail(StopReasonError, err)
 				return
+			}
+			if transformations, ok := ev.InputTransformations.([]any); ok {
+				inputTransformations = transformations
 			}
 			// Capture stop reason for the terminal event.
 			if ev.Delta.StopReason != "" {
@@ -1375,17 +1553,7 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 				builder.fail(StopReasonError, err)
 				return
 			}
-			usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
-			if stopReason == "" {
-				builder.fail(StopReasonError, errors.New("Anthropic stream ended without a stop reason"))
-				return
-			}
-			if stopReason == StopReasonError {
-				builder.fail(stopReason, errors.New(errMsg))
-			} else {
-				builder.done(stopReason, usage, errMsg)
-			}
-			return
+			sawMessageStop = true
 		}
 	}
 
@@ -1397,15 +1565,39 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 		builder.fail(StopReasonAborted, err)
 		return
 	}
-	// message_stop returns from the loop, so reaching here after
-	// message_start means the stream ended before message_stop.
-	if sawMessageStart {
+	if sawMessageStart && !sawMessageStop {
 		builder.fail(StopReasonError, errors.New("Anthropic stream ended before message_stop"))
 		return
 	}
 
 	usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
-	builder.fail(StopReasonError, errors.New("Anthropic stream ended without a stop reason"))
+	if stopReason == "" {
+		builder.fail(StopReasonError, errors.New("Anthropic stream ended without a stop reason"))
+		return
+	}
+	if stopReason == StopReasonError {
+		builder.fail(stopReason, errors.New(errMsg))
+		return
+	}
+	if len(inputTransformations) > 0 {
+		transformations := make([]map[string]any, len(inputTransformations))
+		for i, value := range inputTransformations {
+			if value == nil {
+				builder.fail(StopReasonError, errors.New("Cannot read properties of null (reading 'type')"))
+				return
+			}
+			input, _ := value.(map[string]any)
+			output := map[string]any{}
+			for _, key := range []string{"type", "path", "reason"} {
+				if value := input[key]; value != nil {
+					output[key] = value
+				}
+			}
+			transformations[i] = output
+		}
+		builder.partial.Diagnostics = append(builder.partial.Diagnostics, AssistantMessageDiagnostic{Type: "anthropic_input_transformations", Timestamp: time.Now().UnixMilli(), Details: map[string]any{"transformations": transformations}})
+	}
+	builder.done(stopReason, usage, errMsg)
 }
 
 // mapAnthStopReason maps Anthropic stop_reason values to canonical terminal

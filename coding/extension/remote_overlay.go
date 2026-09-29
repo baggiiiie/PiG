@@ -119,6 +119,22 @@ func (m OverlayMarginValue) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]int{"top": m.Top, "right": m.Right, "bottom": m.Bottom, "left": m.Left})
 }
 
+// RemoteOverlayState is the host's mounted-overlay state at a control/input boundary.
+type RemoteOverlayState struct {
+	Hidden  bool                 `json:"hidden"`
+	Focused bool                 `json:"focused"`
+	Visible bool                 `json:"visible"`
+	Bounds  *RemoteOverlayBounds `json:"bounds,omitempty"`
+}
+
+// RemoteOverlayBounds is the last rendered terminal-relative rectangle.
+type RemoteOverlayBounds struct {
+	Row    int `json:"row"`
+	Col    int `json:"col"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
 // RemoteOverlayHandle is returned to the caller of
 // [UIContext.RunRemoteOverlay] so it can push rendered lines into the
 // overlay and close it when the remote producer signals completion.

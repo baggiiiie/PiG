@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	pig "github.com/MichaelKinsy/PiG"
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -25,6 +27,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/llama"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -160,12 +163,14 @@ type InteractiveMode struct {
 	resourceSourceInfo map[string]ResourceSourceInfo
 
 	// UI components
-	chatContainer   *tui.Container
-	extHeader       *specialLinesComponent
-	extFooter       *specialLinesComponent
-	widgetContainer *tui.Container
-	editor          *tui.Editor
-	statusLine      *StatusLine
+	chatContainer       *tui.Container
+	extHeader           *specialLinesComponent
+	extFooter           *specialLinesComponent
+	widgetContainer     *tui.Container
+	editor              *tui.Editor
+	editorSnapshotOwner *tui.Editor
+	editorSnapshot      atomic.Pointer[string]
+	statusLine          *StatusLine
 
 	// loadedResourcesContainer holds the loaded-resources listing between the
 	// header and the transcript, so clearing the transcript keeps it.
@@ -212,10 +217,9 @@ type InteractiveMode struct {
 	// ignored then, mirroring upstream's ignoreSigint listener.
 	suspended atomic.Bool
 
-	// signalShutdownDone guards the session_shutdown emission on the signal
-	// path so the pre-cancellation hook and the ctx.Done branch cannot both
-	// deliver it. Mirrors upstream's isShuttingDown guard.
+	// Shutdown paths share an emission guard and join in-flight cleanup before owner-loop terminal teardown.
 	signalShutdownDone atomic.Bool
+	shutdownMu         sync.Mutex
 	// reloadIssues collects extension/tool reload failures from the most recent
 	// /reload so ReloadDiagnostics can surface them in-session as "Extension
 	// issues" instead of dropping them to a TUI-clobbered stderr. Reset at the
@@ -230,6 +234,9 @@ type InteractiveMode struct {
 	backgroundCtx    context.Context
 	backgroundCancel context.CancelFunc
 	backgroundTasks  sync.WaitGroup
+	arminComponents  []*arminComponent
+	markdownQueue    tui.MarkdownTransformQueue
+	markdownBlocks   []tui.Disposable
 	clipboardCtx     context.Context
 	clipboardReads   *sync.WaitGroup
 	// openURL opens a URL in the default browser for OSC 8 hyperlink activation.
@@ -291,6 +298,8 @@ type InteractiveMode struct {
 	// dispatched while the agent is mid-turn; they promote to chat
 	// after the bash goroutine finishes.
 	bashCancel          context.CancelFunc
+	userBashTasks       map[*userBashTask]struct{}
+	settlingUserBash    bool
 	pendingBashBlocks   []*tui.BashExecutionBlock
 	pendingBashBlocksMu sync.Mutex
 
@@ -362,9 +371,10 @@ type InteractiveMode struct {
 	// goroutine. evCurrentBlock/evTurnIndex are that handler's
 	// cross-event state (one assistant block per message; mirrors upstream's
 	// per-stream locals), only ever touched on the main goroutine.
-	eventCh        <-chan agent.AgentEvent
-	evCurrentBlock *tui.AssistantMessageBlock
-	evTurnIndex    int
+	eventCh            <-chan agent.AgentEvent
+	evCurrentBlock     *tui.AssistantMessageBlock
+	bugReportHintShown bool
+	evTurnIndex        int
 
 	// branchSummaryOrder tracks rendered BranchSummaryComponents so
 	// Ctrl+O expand/collapse applies to them alongside tool components.
@@ -373,11 +383,16 @@ type InteractiveMode struct {
 
 	// anthropicSubWarningShown gates the one-time Anthropic subscription
 	// auth warning. Mirrors upstream anthropicSubscriptionWarningShown.
-	anthropicSubWarningShown bool
+	anthropicSubWarningShown     bool
+	previousThinkingDroppedCount int
 
 	// inputLoopErr, owned by the input loop, ends it with the error of a
 	// keystroke handled after a subprocess listener's verdict.
 	inputLoopErr error
+	inputReadCh  chan inputChunk
+	inputErrCh   chan error
+	inputOwner   *terminalInputOwner
+	themeState   interactiveThemeState
 
 	// terminalInputListeners: extension-registered raw input handlers.
 	// Mirrors upstream extensionTerminalInputUnsubscribers.
@@ -386,9 +401,19 @@ type InteractiveMode struct {
 	terminalInputListenerID   uint64
 	terminalInputListeners    []terminalInputListener
 	extensionShortcutListener func(data string) (consume bool)
-	modalInputMu              sync.RWMutex
-	modalInputCh              chan []byte
-	modalInputDepth           int
+	// remoteEditor is the extension editor component installed in place of
+	// the editor (ctx.ui.setEditorComponent), or nil.
+	remoteEditor *remoteEditor
+	// remoteEditorEvents runs the component's events on the owner loop.
+	remoteEditorEvents remoteEventQueue
+	// tuiStopped is set once the TUI stopped, for writers off the owner loop.
+	tuiStopped atomic.Bool
+	// extensionKeybindings is the keybinding table extension state
+	// snapshots carry, republished when the keybindings reload.
+	extensionKeybindings atomic.Pointer[map[string]any]
+	modalInputMu         sync.RWMutex
+	modalInputCh         chan []byte
+	modalInputDepth      int
 	// modalDoneCh is closed by setModalInputChannel(nil) when a modal tears
 	// down. The stdin reader selects on it so a send to the outgoing modal
 	// channel can never block forever when the modal stops draining mid-spam.
@@ -404,20 +429,24 @@ type InteractiveMode struct {
 	// time the current LLM call began; zero when idle.
 	workStart time.Time
 
-	// turnSystemPrompt is the per-turn system prompt override produced by
-	// before_agent_start handlers. Cleared when the turn finishes.
-	// Protected by turnSystemPromptMu because the agent goroutine reads it
-	// from beforeProviderHook while the UI goroutine updates it around
-	// submission boundaries.
-	turnSystemPromptMu  sync.RWMutex
-	turnSystemPrompt    string
-	hasTurnSystemPrompt bool
+	// turnSystemPrompt is the active run's rendered system prompt, which
+	// replaces the base prompt until the run settles. Protected by
+	// turnSystemPromptMu because extension and turn goroutines read it
+	// while the turn goroutine and tool changes update it.
+	baseSystemPromptOptions atomic.Pointer[extension.BuildSystemPromptOptions]
+	turnSystemPromptMu      sync.RWMutex
+	turnSystemPrompt        string
+	hasTurnSystemPrompt     bool
+	// runPrompt holds the active run's before_agent_start inputs, as Pi's _runSystemPromptOptions; nil outside a run. runPromptMu serializes installing, re-rendering and clearing it with the prompt forced on the agent.
+	runPromptMu sync.Mutex
+	runPrompt   *interactiveRunPrompt
 
-	// rawRestore is the cleanup closure returned by tui.EnterRawMode.
-	// The external-editor flow uses it to temporarily restore
-	// cooked mode, hand the terminal to $EDITOR, then re-enter raw
-	// mode for pig.
-	rawRestore func()
+	// rawDrain consumes late protocol input before renderer teardown; temporary handoffs restore without draining.
+	rawDrain             func()
+	rawRestore           func()
+	inputReader          *interactiveTerminalReader
+	externalEditorActive bool
+	externalEditorInput  func()
 
 	// File-based prompt templates loaded from
 	// <agentDir>/prompts/ (user) and <cwd>/.pig/prompts/ (project).
@@ -425,6 +454,11 @@ type InteractiveMode struct {
 	// falls through to template expansion when no builtin matches.
 	promptTemplates   []PromptTemplate
 	promptDiagnostics []extension.ResourceDiagnostic
+	// Loaded theme resources and diagnostics are retained independently of the selectable theme registry.
+	loadedThemes     []loadedTheme
+	themeDiagnostics []extension.ResourceDiagnostic
+	// extensionConflicts are the tool and flag conflicts the last reload found; Pi lists them with the extension load errors.
+	extensionConflicts []ExtensionConflict
 	// slashCatalog is the resource side of pi.getCommands() (templates,
 	// skills, provenance), republished whole whenever the owner loop changes
 	// one, because extension host calls read it off the owner loop.
@@ -484,10 +518,15 @@ type InteractiveMode struct {
 	pendingExtensionErrors []extension.ExtensionError
 	extensionErrorWakeCh   chan struct{}
 
-	// commandArgumentCompletions serves extension commands'
-	// getArgumentCompletions to the editor.
-	argumentCompletionsOnce    sync.Once
-	commandArgumentCompletions *commandArgumentCompletions
+	autocompleteFactories   []autocompleteRegistration
+	autocompleteProvider    *extension.AutocompleteProvider
+	autocompleteEpoch       context.Context
+	autocompleteEpochCancel context.CancelFunc
+	autocompletePending     <-chan struct{}
+	currentInputTicket      *inputTicket
+	pendingUserInputs       []string
+	onInputCallback         func(string)
+	initialMessagesDone     <-chan struct{}
 }
 
 // postUITask hands a closure to the main input loop to run
@@ -679,12 +718,11 @@ func (m *InteractiveMode) modalRouteWatch() (chan []byte, chan struct{}, <-chan 
 // unbuffered readCh: when the next selector arms, modalChangedCh fires and
 // the chunk routes to it.
 func (m *InteractiveMode) routeInputChunk(ctx context.Context, chunk []byte, readCh chan<- inputChunk) *inputTicket {
-	return m.routeInputSequence(ctx, chunk, false, readCh)
+	return m.routeInputSequence(ctx, chunk, nil, readCh)
 }
 
-// routeInputSequence is routeInputChunk for a sequence the pump parsed from
-// its input; more reports that sequences already read follow it.
-func (m *InteractiveMode) routeInputSequence(ctx context.Context, chunk []byte, more bool, readCh chan<- inputChunk) *inputTicket {
+// routeInputSequence routes a decoded event with its terminal-read completion boundary. A protocol-only suffix closes readDone without manufacturing another input event.
+func (m *InteractiveMode) routeInputSequence(ctx context.Context, chunk []byte, readDone <-chan struct{}, readCh chan<- inputChunk) *inputTicket {
 	ticket := newInputTicket()
 	for {
 		modalCh, modalDone, changed := m.modalRouteWatch()
@@ -702,7 +740,7 @@ func (m *InteractiveMode) routeInputSequence(ctx context.Context, chunk []byte, 
 			}
 		}
 		select {
-		case readCh <- inputChunk{data: chunk, ticket: ticket, more: more}:
+		case readCh <- inputChunk{data: chunk, ticket: ticket, readDone: readDone}:
 			return ticket
 		case <-changed:
 			// A modal armed (or the route otherwise changed) while the busy
@@ -721,6 +759,8 @@ type InteractiveOptions struct {
 	AgentDir string
 	Model    *ai.Model
 	Settings Settings
+	// InitialThemeSetting selects a theme for this run without changing the SettingsManager. Explicit selections replace it; absent selections follow the current manager.
+	InitialThemeSetting *string
 	// SettingsManager provides read/write access to global settings.
 	// Wired by main.go via coding.Services.
 	SettingsManager *SettingsManager
@@ -771,7 +811,7 @@ type InteractiveOptions struct {
 	// existing session matches, Create uses this ID instead of
 	// generating a random one.
 	SessionID string
-	// ThemePaths lists additional theme files/directories to load.
+	// ThemePaths lists resolved theme files/directories in resource precedence order.
 	ThemePaths []string
 	// NoPromptTemplates disables prompt template discovery.
 	NoPromptTemplates bool
@@ -798,7 +838,7 @@ type InteractiveOptions struct {
 	// coding.NewSession's ResumePath field.
 	SessionHandle InteractiveSessionHandle
 
-	// ContextUsage returns the live Session projection estimate for footer updates.
+	// ContextUsage returns the live Session projection estimate for stock footer and extension usage reads.
 	ContextUsage func() (tokens *int, contextWindow int)
 
 	// ModelBuilder constructs an *ai.Model from a "<provider>/<id>"
@@ -807,6 +847,9 @@ type InteractiveOptions struct {
 	// caller injects the constructor. nil disables /model switching
 	// (handler falls back to print-only).
 	ModelBuilder func(spec string) (*ai.Model, error)
+
+	// DefaultModelPerProvider shares the startup resolver's provider defaults with /login.
+	DefaultModelPerProvider map[string]string
 
 	// ModelLookup resolves a provider/model identity through the Session-owned runtime.
 	ModelLookup  func(providerID, modelID string) *ai.Model
@@ -827,6 +870,9 @@ type InteractiveOptions struct {
 	// May be nil during tests or when no extensions are loaded.
 	// Events are dispatched through this runner via event_bridge.go.
 	ExtensionRunner *inproc.Runner
+
+	// SessionStartEvent is the factory-selected startup/new/resume/fork event for the current Session.
+	SessionStartEvent *extension.SessionStartEvent
 
 	// ExtensionContext is the live extension context shared with the
 	// runner. Caller-supplied to ensure extCtx.Session points at the
@@ -895,6 +941,8 @@ type InteractiveOptions struct {
 	// /skill:name commands in user prompts.
 	// Mirrors upstream resourceLoader.getSkills() (agent-session.ts:1124-1151).
 	Skills []*SkillDef
+	// SkillDiagnostics retains ordered load-time collisions for the startup listing.
+	SkillDiagnostics []extension.ResourceDiagnostic
 	// RebuildSystemPrompt reconstructs the base system prompt + structured
 	// prompt options after /reload from the current skills/context files.
 	// Mirrors upstream session.reload() → _rebuildSystemPrompt.
@@ -906,7 +954,7 @@ type InteractiveOptions struct {
 	// Used by /reload to re-discover skills from disk. If empty, skills
 	// are not reloaded (only the initial set from startup is used).
 	SkillPaths []string
-	// NoSkills disables skill loading and reload.
+	// NoSkills disables automatic skill discovery; explicitly selected and extension-discovered paths still load on reload.
 	NoSkills bool
 
 	// ContextFiles lists the loaded AGENTS.md/CLAUDE.md project context files.
@@ -918,11 +966,6 @@ type InteractiveOptions struct {
 	// then each appended system prompt were read from, as upstream
 	// getSystemPromptSource and getAppendSystemPromptSources report them.
 	SystemPromptSourcePaths []string
-
-	// ThinkingLevel is the initial thinking level override from --thinking.
-	// Empty means use default (settings or "medium"). Mirrors upstream
-	// interactiveOptions.thinking (interactive-mode.ts:186).
-	ThinkingLevel string
 
 	// SubprocessUIBridge, when non-nil, is the UI bridge for subprocess
 	// extensions. Run() wires it to the TUI after creation via
@@ -958,11 +1001,7 @@ type InteractiveOptions struct {
 	// handler closures and state that upstream discards on reload.
 	ReloadBuiltinExtensions func() []extension.Extension
 
-	// NoModelWarning, when non-empty, is rendered as a yellow warning
-	// line immediately before the welcome banner. Mirrors upstream
-	// reportDiagnostics("Warning: No models available. ...") which the
-	// pi TUI prints when the user starts without `--model` and has no
-	// detectable credentials.
+	// NoModelWarning carries the interactive-only model-selection diagnostic, including a failed saved-model restoration followed by a fallback.
 	NoModelWarning string
 	// StartupDiagnostics are shown in the chat after the welcome banner.
 	// Mirrors upstream InteractiveModeOptions.startupDiagnostics.
@@ -994,17 +1033,45 @@ func (m *InteractiveMode) currentSystemPrompt() string {
 	return m.opts.SystemPrompt
 }
 
-// currentSystemPromptOptions returns the base system-prompt construction
-// inputs (refreshed on /reload via RebuildSystemPrompt) with cwd
-// defaulted to the session cwd. Backs CommandContext.GetSystemPromptOptions.
-// Reports base inputs only, not per-turn before_agent_start changes
-// (matches upstream getSystemPromptOptions, runner.ts:653).
-func (m *InteractiveMode) currentSystemPromptOptions() extension.BuildSystemPromptOptions {
-	opts := m.opts.SystemPromptOptions
+func (m *InteractiveMode) rebuildToolSystemPrompt() {
+	opts := new(extension.NormalizeBuildSystemPromptOptions(m.opts.SystemPromptOptions))
 	if opts.Cwd == "" {
 		opts.Cwd = m.opts.CWD
 	}
-	return opts
+	if m.agent != nil {
+		opts.SelectedTools = m.activeToolNames()
+	}
+	if m.newRunner != nil {
+		options := prompts.WithToolDefinitions(prompts.FromExtensionOptions(*opts), m.newRunner.Tools())
+		opts.ToolSnippets, opts.ToolGuidelines = options.ToolHints, options.ToolGuidelines
+	}
+	m.baseSystemPromptOptions.Store(opts)
+	if m.structuredSystemPrompt() {
+		text := prompts.BuildDefaultPrompt(prompts.FromExtensionOptions(*opts))
+		m.turnSystemPromptMu.Lock()
+		m.opts.SystemPrompt = text
+		m.turnSystemPromptMu.Unlock()
+	}
+}
+
+// structuredSystemPrompt reports whether the prompt is built from SystemPromptOptions. A caller that supplied no tool metadata owns an opaque prompt string.
+func (m *InteractiveMode) structuredSystemPrompt() bool {
+	return m.opts.SystemPromptOptions.ToolSnippets != nil || m.opts.SystemPromptOptions.ToolGuidelines != nil
+}
+
+// currentSystemPromptOptions returns the stored base construction inputs without changing command edits. Tool activation and resource reload replace the object; per-turn overrides do not.
+func (m *InteractiveMode) currentSystemPromptOptions() *extension.BuildSystemPromptOptions {
+	if opts := m.baseSystemPromptOptions.Load(); opts != nil {
+		return opts
+	}
+	opts := new(extension.NormalizeBuildSystemPromptOptions(m.opts.SystemPromptOptions))
+	if opts.Cwd == "" {
+		opts.Cwd = m.opts.CWD
+	}
+	if m.baseSystemPromptOptions.CompareAndSwap(nil, opts) {
+		return opts
+	}
+	return m.baseSystemPromptOptions.Load()
 }
 
 func (m *InteractiveMode) setTurnSystemPrompt(prompt string) {
@@ -1047,6 +1114,10 @@ func NewInteractiveMode(opts InteractiveOptions) *InteractiveMode {
 		spinnerIntervalCh:    make(chan time.Duration, 1),
 		outputPad:            opts.Settings.GetOutputPad(),
 	}
+	if opts.InitialThemeSetting != nil {
+		setting := *opts.InitialThemeSetting
+		m.themeState.currentThemeSetting.Store(&setting)
+	}
 	return m
 }
 
@@ -1084,34 +1155,57 @@ func quoteIfNeeded(value string) string {
 
 var quoteUnsafeRE = regexp.MustCompile(`[^a-zA-Z0-9_\-./~:@]`)
 
-// resumeCommand builds the "pig [--session-dir <dir>] --session <id>" string
-// for a persisted session, or "" when the session has no on-disk file.
-// Mirrors upstream formatResumeCommand (interactive-mode.ts:205). Pure so it
-// can be unit-tested without a live session or terminal.
-func resumeCommand(sessionPath, sessionID, sessionDir string) string {
+// resumeCommandSession is the SessionManager state read when formatting a resume command.
+type resumeCommandSession struct {
+	persisted             bool
+	sessionFile           string
+	sessionID             string
+	sessionDir            string
+	usesDefaultSessionDir bool
+}
+
+// formatResumeCommand returns no command for non-TTY output, in-memory sessions, or an absent session file. stdoutIsTTY is the current stdout terminal state.
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts:309-321.
+func formatResumeCommand(sessionManager resumeCommandSession, stdoutIsTTY bool) string {
+	if !stdoutIsTTY || !sessionManager.persisted {
+		return ""
+	}
+	return resumeCommand(sessionManager.sessionFile, sessionManager.sessionID, sessionManager.sessionDir, !sessionManager.usesDefaultSessionDir)
+}
+
+// resumeCommand formats a session ID and optional custom directory only when the session file exists. includeSessionDir preserves an explicitly empty custom directory.
+func resumeCommand(sessionPath, sessionID, sessionDir string, includeSessionDir bool) string {
 	if sessionPath == "" {
 		return "" // not persisted (--no-session)
 	}
 	if _, err := os.Stat(sessionPath); err != nil {
 		return ""
 	}
-	parts := []string{"pig"}
-	if sessionDir != "" {
+	parts := []string{AppName}
+	if includeSessionDir {
 		parts = append(parts, "--session-dir", quoteIfNeeded(sessionDir))
 	}
 	parts = append(parts, "--session", sessionID)
 	return strings.Join(parts, " ")
 }
 
-// printResumeHint writes "To resume this session: pig --session <id>" after the
-// terminal is restored on an interactive quit (not on signal shutdown). The
-// TTY check is implicit: interactive mode only runs on a TTY (raw mode is
-// required). Mirrors upstream shutdown() (interactive-mode.ts:3313).
+var stdoutIsTTY = func() bool { return term.IsTerminal(int(os.Stdout.Fd())) }
+
+// printResumeHint writes the resume command after the terminal is restored on an interactive quit, only for a persisted session with an existing file and TTY stdout.
 func (m *InteractiveMode) printResumeHint() {
-	if m.currentSession() == nil {
+	session := m.currentSession()
+	if session == nil {
 		return
 	}
-	cmd := resumeCommand(m.currentSession().Path(), m.currentSession().ID(), m.opts.SessionDir)
+	resolvedDir, _ := filepath.Abs(m.opts.SessionDir)
+	defaultDir, _ := filepath.Abs(defaultSessionDir(session.CWD()))
+	cmd := formatResumeCommand(resumeCommandSession{
+		persisted:             session.Path() != "",
+		sessionFile:           session.Path(),
+		sessionID:             session.ID(),
+		sessionDir:            m.opts.SessionDir,
+		usesDefaultSessionDir: m.opts.SessionDir == "" || resolvedDir == defaultDir,
+	}, stdoutIsTTY())
 	if cmd == "" {
 		return
 	}
@@ -1132,30 +1226,22 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	m.backgroundCtx, m.backgroundCancel = context.WithCancel(ctx)
 	defer func() {
 		m.backgroundCancel()
+		m.disposeArminComponents()
+		m.disposeMarkdownBlocks()
 		m.backgroundTasks.Wait()
+		m.userBashTasks = nil
 		m.backgroundCtx = nil
 	}()
 	mark := m.opts.StartupMark
 	if mark == nil {
 		mark = func(string) {} // no-op
 	}
-	// Detect dark/light terminal and set theme colors.
-	// If Settings.Theme is explicitly set, resolve it; otherwise auto-detect
-	// from COLORFGBG (same as upstream theme.ts:initTheme).
-	tui.SetThemeSetting(m.opts.Settings.Theme)
-	if !m.opts.NoThemes {
-		registry := tui.ActiveThemeRegistry()
-		themesDir := filepath.Join(m.opts.AgentDir, "themes")
-		if _, err := os.Stat(themesDir); err == nil {
-			_ = registry.LoadDir(themesDir) // best-effort; don't block startup
-		}
-		loadThemePaths(registry, m.opts.ThemePaths, func(err error) {
-			fmt.Fprintf(os.Stderr, "theme load: %v\n", err)
-		})
-	}
+	// Resolve the environment fallback before the terminal can answer OSC 11.
+	tui.SetThemeSetting(m.getThemeSelection())
+	m.loadThemes()
 	// Re-apply theme in case it was a custom theme name.
-	if m.opts.Settings.Theme != "" {
-		tui.SetThemeSetting(m.opts.Settings.Theme)
+	if setting := m.getThemeSelection(); setting != "" {
+		tui.SetThemeSetting(setting)
 	}
 	mark("theme-detected")
 
@@ -1170,11 +1256,13 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	m.tuiInst.SetShowHardwareCursor(m.opts.Settings.GetShowHardwareCursor())
 	m.tuiInst.SetClearOnShrink(m.opts.Settings.GetClearOnShrink())
 	m.installRenderDispatcher()
+	themeWatcher := m.startThemeWatcher(ctx)
+	defer themeWatcher.Close()
 	m.tuiInst.SetOverlayCommandDispatcher(func(command func()) {
 		m.runOnMain(m.runCtx, command)
 	})
 	mark("pre-raw-mode")
-	restore, err := tui.EnterRawMode()
+	restore, drain, err := tui.EnterRawModeWithDrain()
 	if err != nil {
 		return fmt.Errorf("interactive: raw mode: %w", err)
 	}
@@ -1185,15 +1273,10 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	}()
 	mark("raw-mode-entered")
 	m.rawRestore = restore
+	m.rawDrain = drain
 	m.tuiInst.HideCursor()
 	defer m.tuiInst.ShowCursor()
-	// Centralized, idempotent renderer teardown. Registered after ShowCursor so
-	// LIFO runs it FIRST on any non-SIGHUP return (ctx.Done, input error,
-	// explicit quit): the renderer leaves the alternate screen and restores
-	// mouse/autowrap before the cursor and cooked mode are restored, matching
-	// upstream ordering. The SIGHUP path exits via os.Exit(129), which skips
-	// defers and correctly avoids writing to a dead terminal. Mirrors upstream
-	// stopInteractiveTui().
+	// Centralized, idempotent renderer teardown runs before the deferred cursor and cooked-mode restoration on normal quit or graceful signal shutdown. A dead-terminal emergency exits without unwinding these terminal writes.
 	defer m.stopInteractiveTui()
 
 	// Clear screen
@@ -1211,6 +1294,7 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	// an off-owner-loop invalidation from racing the swap or hitting a stopped
 	// renderer.
 	m.keybindings = NewKeybindingsManager(m.opts.AgentDir)
+	m.publishExtensionKeybindings()
 	m.extHeader = newSpecialLinesComponent(m.renderNow)
 	m.setBuiltInHeader(m.opts.Verbose || m.toolsExpanded)
 	m.loadedResourcesContainer = tui.NewContainer()
@@ -1218,14 +1302,24 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	m.extFooter = newSpecialLinesComponent(m.renderNow)
 	mark("tui-layout-built")
 	m.editor = tui.NewEditor()
+	m.bindEditorSnapshot()
 	m.editor.EmbedWorkingStatus = true
 	defer m.clearStatusIndicator("")
 	m.editorContainer = tui.NewContainer()
 	m.editorContainer.Add(m.editor)
-	m.editor.Focused = true
 	m.tuiInst.SetFocus(m.editor)
 	m.editor.SetPaddingX(m.opts.Settings.GetEditorPaddingX())
 	m.editor.SetAutocompleteMaxVisible(m.opts.Settings.GetAutocompleteMaxVisible())
+	m.startTerminalInput(ctx, os.Stdin)
+	defer func() {
+		if inputErr := m.stopTerminalInput(); inputErr != nil {
+			err = errors.Join(err, inputErr)
+		}
+	}()
+	m.beginStartupSubmitWindow()
+	if err := m.initializeTerminalTheme(ctx, os.Stdout); err != nil {
+		return err
+	}
 	// Run the @-file fd search off the input thread so a deep tree walk
 	// (e.g. @~/<rare-name>) can't freeze typing. The worker posts its
 	// result back here via uiTaskCh so the editor is mutated and rendered
@@ -1234,12 +1328,12 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	m.editor.SetAsyncApply(func(apply func()) {
 		m.postUITask(func() { apply(); m.tuiInst.RequestRender() })
 	})
+	m.editor.SetAutocompleteTaskOwner(m.backgroundCtx, m.backgroundTasks.Go, m.reportAutocompleteError)
 	m.editor.SetAutocomplete(m.buildAutocompleteProvider())
 	m.applyEditorMaxVisible()
 	m.statusLine = m.newFooter() // timings rebound after agent constructed
 	m.statusLine.SetStatusHook(m.showStatus)
 	m.statusLine.SetCwd(m.opts.CWD)
-	m.statusLine.SetThinkingLevel(m.opts.Settings.DefaultThinkingLevel)
 	// Set auto-compact indicator from settings (nil == true default).
 	autoCompact := m.opts.Settings.Compaction == nil ||
 		m.opts.Settings.Compaction.Enabled == nil ||
@@ -1256,8 +1350,11 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 
 	m.statusContainer = tui.NewContainer()
 	m.pendingMessagesContainer = tui.NewContainer()
-	m.widgetContainer = tui.NewContainer()
+	m.widgetContainer = tui.NewContainer(tui.NewSpacer(1))
 	m.mountInteractiveTui()
+	// Pi sets up managed tools after the startup header and before extensions, still under handleStartupSubmit; setupEditorSubmitHandler follows (interactive-mode.ts:1017-1028).
+	m.ensureManagedTools(ctx, tools.NewToolsManager(m.opts.AgentDir))
+	m.endStartupSubmitWindow()
 
 	// Build slash registry up front so any extension's RegisterCommand
 	// can mirror its registration into the registry as it loads.
@@ -1265,11 +1362,7 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 
 	// Load file-based prompt templates from <agentDir>/prompts and
 	// <cwd>/.pig/prompts. They remain fixed for this Session.
-	if m.opts.NoPromptTemplates {
-		m.promptTemplates = nil
-	} else {
-		m.loadPromptTemplates()
-	}
+	m.loadPromptTemplates()
 	if m.opts.ResourceSourceInfoProvider != nil {
 		m.resourceSourceInfo = m.opts.ResourceSourceInfoProvider()
 	}
@@ -1284,6 +1377,9 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	// SetInvalidate enables live TUI refresh when widget content changes.
 	if m.opts.SubprocessUIBridge != nil {
 		extUI := &ExtUIContext{m: m}
+		if keybindings, ok := m.opts.SubprocessUIBridge.(interface{ SetKeybindingsFunc(func() any) }); ok {
+			keybindings.SetKeybindingsFunc(func() any { return m.extensionKeybindings.Load() })
+		}
 		m.opts.SubprocessUIBridge.SetUIContext(extUI)
 		m.opts.SubprocessUIBridge.SetInvalidate(m.requestRender)
 		// Wire Notify through the UIBridge so subprocess extension commands
@@ -1383,10 +1479,7 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 
 	// Wire the extension runner. May be nil; event_bridge.go helpers are nil-safe.
 	m.newRunner = m.opts.ExtensionRunner
-	// Wire inproc ContextActions and UI so in-process extensions (piglet,
-	// workflow, hooks) can use the same interactive surface as subprocess
-	// extensions.
-	m.wireInprocContextActions()
+	// The rebind owner installs UI/actions before dispatching session_start.
 
 	// Wire agent + on-disk session: the SDK is the source of truth.
 	// SessionHandle MUST be supplied by the caller (cmd/pig/main.go
@@ -1396,10 +1489,11 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("interactive: SessionHandle is required: construct via coding.NewSession")
 	}
 	m.agent = m.opts.SessionHandle.Agent()
+	m.rebuildToolSystemPrompt()
 	m.eventCh = m.opts.SessionHandle.Events()
 	extCtx.Session = m.currentSession()
 
-	m.setupExtensionShortcutListener(ctx)
+	m.reconfigureRemoteEditor()
 
 	// pig divergence (D55): ignore Kitty key releases for the debug hotkey.
 	m.addKeyPressListener(func(data string) bool {
@@ -1428,7 +1522,6 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	// Set terminal title. Mirrors upstream
 	// interactive-mode.ts:634-642 (updateTerminalTitle). Deferred clear
 	// restores the shell's own title on exit.
-	m.updateTerminalTitle()
 	defer tui.SetTerminalTitle("")
 	defer tui.SetTerminalProgress(false)
 	// Pre-populate status-line name from session on resume.
@@ -1436,62 +1529,40 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 		m.statusLine.SetName(n)
 	}
 
-	// Initialise thinking level from settings + model capabilities.
+	// Bind thinking presentation to the Session's effective startup state.
 	m.initThinkingLevel()
 
-	// Populate scoped model IDs from settings.
-	if len(m.opts.Settings.EnabledModels) > 0 {
-		m.scopedModelIDs = slices.Clone(m.opts.Settings.EnabledModels)
-	}
+	m.initScopedModels()
 
 	// Dispatch session_start through the extension runner. The bridge performs
 	// the typed event conversion.
 	mark("pre-emit-session-start")
-	emitSessionStart(m.newRunner, "startup")
-	m.extendResourcesFromExtensions("startup")
-	// Rebuild autocomplete after startup resource discovery so extension-
-	// registered slash commands are present in the initial `/` popup, not only
-	// after an explicit /reload.
-	m.editor.SetAutocomplete(m.buildAutocompleteProvider())
+	if err := m.awaitExtensionUI(ctx, func(ctx context.Context) error {
+		return m.rebindCurrentSession(ctx, false)
+	}); err != nil {
+		return err
+	}
 	mark("post-emit-session-start")
 
 	// Loaded resources follow the built-in or extension-supplied header.
-	if m.opts.NoModelWarning != "" {
-		// Show even under quietStartup: this is a runtime warning the
-		// user must see to know why no LLM calls will succeed.
-		m.appendToChat(tui.NewMarkdown("**Warning: " + m.opts.NoModelWarning + "**"))
-	}
-	m.showLoadedResources(false)
+	m.showLoadedResources(false, true)
 	// Quiet startup suppresses help and resource listings, not the initial editor and footer.
 	m.tuiInst.Render()
 	mark("first-render-done")
 
-	// Surface extension load/build/register failures from startup. Shown even
-	// under quietStartup because a silently-dropped extension (build failure,
-	// manifest/runtime mismatch, register error) otherwise leaves no trace: the
-	// errors previously went only to a TUI-clobbered stderr. Mirrors upstream
-	// showLoadedResources' extension-issues block (showDiagnosticsWhenQuiet:true).
-	if m.opts.SubprocessHost != nil {
-		if issues := m.opts.SubprocessHost.LoadErrors(); len(issues) > 0 {
-			var b strings.Builder
-			b.WriteString("**[Extension issues]**\n")
-			for _, issue := range issues {
-				b.WriteString("- ")
-				b.WriteString(issue)
-				b.WriteString("\n")
-			}
-			m.appendToChat(tui.NewMarkdown(b.String()))
-			m.tuiInst.Render()
-		}
-	}
 	m.showStartupDiagnostics()
-	m.showPromptDiagnostics()
+	// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:init displays modelFallbackMessage after startup diagnostics, even under quiet startup.
+	if m.opts.NoModelWarning != "" {
+		m.showWarning(m.opts.NoModelWarning)
+	}
 	m.showCrashNotice()
 
 	// Render resumed messages after loaded resources without clearing either.
 	if m.opts.ResumePath != "" {
 		m.renderSessionEntries()
 	}
+	m.renderProjectTrustWarningIfNeeded()
+	m.tuiInst.Render()
 
 	// Show "what's new" on fresh sessions (no prior messages) when the
 	// binary version differs from the last recorded version, and send the
@@ -1514,8 +1585,6 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 			m.tuiInst.Render()
 		}
 	}
-
-	m.ensureManagedTools(ctx, tools.NewToolsManager(m.opts.AgentDir))
 
 	// Check tmux keyboard setup asynchronously (mirrors upstream
 	// checkTmuxKeyboardSetup, interactive-mode.ts:667-675, 768-818).
@@ -1595,23 +1664,6 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 
 	m.startGitBranchWatcher(ctx)
 
-	// Defensive SIGINT handler: in raw mode the terminal driver
-	// shouldn't translate Ctrl+C into a signal (ISIG is off), so the
-	// byte handler in inputLoop is the primary abort path. But if
-	// something external sends SIGINT (parent process, `kill -INT`,
-	// debugger, terminal misconfiguration), route it to the same
-	// abort path instead of letting it tear down pig. SIGTERM is
-	// still handled by main.go and exits the whole process.
-	// SIGHUP means the terminal is gone (SSH disconnect, window close, etc.).
-	// Skip normal TUI cleanup: writing restore sequences to a dead terminal
-	// re-triggers EIO/EPIPE. Just kill children and exit 129.
-	// Mirrors upstream emergencyTerminalExit (interactive-mode.ts:3225-3232).
-	// Terminal-gone (SIGHUP) handling is unix-only. Windows has no SIGHUP; Go
-	// delivers console close/logoff/shutdown as SIGTERM (handled in main.go).
-	// Mirrors upstream `if (!win32) signals.push("SIGHUP")`.
-	stopTerminalGone := m.installTerminalGoneHandler(ctx)
-	defer stopTerminalGone()
-
 	// Upstream registers no general SIGINT handler, so an external SIGINT
 	// terminates pi (interactive-mode.ts registers SIGTERM, plus SIGHUP off
 	// win32, and takes SIGINT only to ignore it while suspended). Terminate
@@ -1651,35 +1703,13 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 		m.handleSubmitWithImages(ctx, m.opts.InitialMessage, m.opts.InitialImages)
 	}
 	if len(m.opts.InitialMessages) > 0 {
-		go m.submitInitialMessages(ctx, m.opts.InitialMessages)
+		done := make(chan struct{})
+		m.initialMessagesDone = done
+		m.backgroundTasks.Go(func() {
+			defer close(done)
+			m.submitInitialMessages(ctx, m.opts.InitialMessages)
+		})
 	}
 	mark("interactive-ready")
 	return m.inputLoop(ctx, os.Stdin)
-}
-
-// loadThemePaths registers the themes of paths, which are in upstream
-// precedence order. Upstream dedupeThemes keeps the first theme of a name;
-// the registry keeps the last one added, so the paths load in reverse.
-func loadThemePaths(registry *tui.ThemeRegistry, paths []string, report func(error)) {
-	for _, path := range slices.Backward(paths) {
-		if err := loadThemePath(registry, path); err != nil && report != nil {
-			report(err)
-		}
-	}
-}
-
-func loadThemePath(registry *tui.ThemeRegistry, path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return registry.LoadDir(path)
-	}
-	theme, err := tui.LoadThemeFile(path)
-	if err != nil {
-		return err
-	}
-	registry.Add(theme)
-	return nil
 }

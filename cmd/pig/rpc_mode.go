@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -26,15 +26,16 @@ import (
 	"github.com/MichaelKinsy/PiG/coding"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/invocation"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
 	piglet "github.com/MichaelKinsy/PiG/coding/piglet"
-	"github.com/MichaelKinsy/PiG/coding/pigletbuild/binarypiglet"
 	"github.com/MichaelKinsy/PiG/coding/rpcclient"
+	json "github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
-	codingexport "github.com/MichaelKinsy/PiG/internal/codingagent/export"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/llama"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
 type rpcTaskGroup struct {
@@ -60,25 +61,28 @@ func (g *rpcTaskGroup) CloseAndWait() {
 	g.wg.Wait()
 }
 
+// rpcModeResources is the startup runtime main hands to RPC mode, as upstream main.ts passes runRpcMode the runtime whose extensions loaded before model resolution.
 type rpcModeResources struct {
-	StartupExtensions *startupExtensionSet
-	// PreTrustExtensionDiagnostics are the pre-trust load errors, reported
-	// with the final load errors as upstream loadFinalExtensionSet does.
-	PreTrustExtensionDiagnostics []codingagent.AgentSessionRuntimeDiagnostic
-	Services                     *coding.Services
-	PromptTemplates              []codingagent.PromptTemplate
-	Skills                       []*codingagent.SkillDef
-	SourceInfo                   map[string]codingagent.ResourceSourceInfo
-	ExtensionConfigs             []subprocess.ExtConfig
-	EmbeddedCells                []subprocess.EmbeddedCell
-	ProjectTrusted               bool
-	ResumePath                   string
+	Services        *coding.Services
+	PromptTemplates []codingagent.PromptTemplate
+	Skills          []*codingagent.SkillDef
+	SourceInfo      map[string]codingagent.ResourceSourceInfo
+	// Extensions, ExtensionHost and ExtensionBridge are the final extension set main loaded. runRPCMode shuts the host down when it returns; main's startupExtensionSet holds the same host and shuts it down again at process exit, when it has no processes left.
+	Extensions      []extension.Extension
+	ExtensionHost   *subprocess.Host
+	ExtensionBridge *subprocess.UIBridge
+	// Model is the startup model main resolved against the extension-populated registry.
+	Model          *ai.Model
+	ProjectTrusted bool
+	ResumePath     string
+	SessionManager *coding.SessionManager
 }
 
 type headlessCommandRunner interface {
 	Commands() []extension.ResolvedCommand
 	Command(string) (extension.ResolvedCommand, bool)
 	ExecuteCommand(context.Context, string, string) bool
+	EmitError(*extension.ExtensionError)
 }
 
 // headlessCommandCatalog routes the prompts of print, JSON and RPC mode as
@@ -144,8 +148,10 @@ func (c headlessCommandCatalog) extensionCommand(message string) (string, string
 }
 
 func (c headlessCommandCatalog) expandPrompt(message string) string {
-	if expanded, ok := codingagent.ExpandSkillCommand(message, c.skills); ok {
+	if expanded, ok, err := codingagent.ExpandSkillCommand(message, c.skills); ok {
 		message = expanded
+	} else if err != nil && c.runner != nil {
+		c.runner.EmitError(err)
 	}
 	if expanded, ok := codingagent.ExpandPromptTemplate(message, c.promptTemplates); ok {
 		message = expanded
@@ -174,7 +180,7 @@ func (c headlessCommandCatalog) sourceInfoForPath(path, kind string) RPCSourceIn
 	return c.slashCatalog().SourceInfoForPath(path, kind)
 }
 
-func rpcGetCommandsResponse(id string, catalog headlessCommandCatalog) RPCResponse {
+func rpcGetCommandsResponse(id rpcRequestID, catalog headlessCommandCatalog) RPCResponse {
 	return rpcSuccess(id, "get_commands", RPCGetCommandsData{Commands: catalog.commands()})
 }
 
@@ -208,6 +214,8 @@ func rpcResolvedSkills(skills []*codingagent.SkillDef, activePiglet *piglet.Pigl
 	for i, skill := range skills {
 		copy := *skill
 		if copy.Path == "" && activePiglet != nil {
+			// pig additive (D18): the synthesized path identifies the inline skill's manifest, not a file to reload as Markdown.
+			copy.SourceInfo.Source = "inline"
 			copy.Path = activePiglet.SourcePath()
 			if copy.Path == "" {
 				copy.Path = "builtin:piglet"
@@ -219,7 +227,7 @@ func rpcResolvedSkills(skills []*codingagent.SkillDef, activePiglet *piglet.Pigl
 	return out
 }
 
-// runRPCMode owns the `--mode rpc` runtime until EOF or termination. Completed queue and shell operations publish through the input-turn executor. It returns 0 on EOF, 1 on failure, or 128+signum after signal-triggered disposal without waiting for more stdin.
+// runRPCMode owns the `--mode rpc` runtime. EOF and termination triggers dispose and exit the process; startup failures and caller cancellation return to main. Protocol records bypass startup's stdout redirection.
 func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet, resources rpcModeResources) (exitCode int) {
 	defer func() {
 		if sig := receivedTerminationSignal.Load(); sig != 0 {
@@ -230,15 +238,26 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	defer cancel()
 
 	var writeMu sync.Mutex
+	// shutdownRequested is an extension's ctx.shutdown() (rpc-mode.ts
+	// shutdownHandler). Upstream checks it after each handled command and at
+	// agent_settled.
+	var shutdownRequested atomic.Bool
+	// stdoutClosed is set when shutdown exits: upstream's process.exit
+	// follows its stdout flush, so the cleanup before the exit writes nothing.
+	stdoutClosed := atomic.Bool{}
+	// RPC owns raw stdout; incidental startup/extension output follows the process-wide guard to stderr.
 	writeImmediate := func(v any) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		writeJSONLine(os.Stdout, v)
+		if stdoutClosed.Load() {
+			return
+		}
+		writeJSONLine(codingagent.RawStdoutWriter(), v)
 	}
 	responses := &rpcResponseTurn{write: writeImmediate}
 	writeRPC := func(v any) {
 		switch v.(type) {
-		case RPCResponse, rpcNullResponse:
+		case RPCResponse, rpcNullResponse, rpcUnknownCommandResponse:
 			responses.complete(v)
 		default:
 			writeImmediate(v)
@@ -246,6 +265,10 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	}
 	rpcUI := newRPCUIContext(writeRPC)
 	defer rpcUI.Close()
+	// Upstream shutdown() unsubscribes the stdout forwarder of Session events
+	// before it disposes the runtime (rpc-mode.ts shutdown).
+	var sessionEventsDetached atomic.Bool
+	var eventForwarderRunning atomic.Bool
 
 	// ── Services & model ───────────────────────────────────────────────────
 
@@ -254,10 +277,7 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		fmt.Fprintf(os.Stderr, "pig --mode rpc: getwd: %v\n", err)
 		return 1
 	}
-	agentDir := os.Getenv("PIG_CODING_AGENT_DIR")
-	if agentDir == "" {
-		agentDir = codingagent.DefaultAgentDir()
-	}
+	agentDir := codingagent.AgentDir()
 
 	services := resources.Services
 	if services == nil {
@@ -270,6 +290,7 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 			fmt.Fprintf(os.Stderr, "pig --rpc: services: %v\n", err)
 			return 1
 		}
+		defer services.Close()
 	}
 	llamaHost := startBuiltInLlama(ctx, services)
 	refreshCatalogsInBackground(ctx, llamaHost)
@@ -279,72 +300,30 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	// RPC refreshes dynamic model catalogs (Radius) in the background, as
 	// upstream main.ts does for RPC mode unless offline (15 s timeout).
 	if codingagent.ModelNetworkEnabled() {
-		go func() {
-			refreshCtx, cancelRefresh := context.WithTimeout(ctx, 15*time.Second)
+		registry.StartModelTask(ctx, func(taskContext context.Context) {
+			refreshCtx, cancelRefresh := context.WithTimeout(taskContext, 15*time.Second)
 			defer cancelRefresh()
 			registry.RefreshCatalogs(refreshCtx, codingagent.CatalogRefreshOptions{AllowNetwork: true})
-		}()
+		})
 	}
 	inlinePigletSystemPrompt(activePiglet)
 	applyPigletPreStart(activePiglet, &flags)
-	modelFlag := flags.Model
-	if modelFlag == "" {
-		modelFlag = pigletModelSpec(activePiglet)
-	}
 	scopePatterns := flags.Models
 	if len(scopePatterns) == 0 {
 		scopePatterns = settings.EnabledModels
 	}
-	selected, err := selectStartupModel(ctx, startupModelOptions{
-		CLIProvider:   flags.Provider,
-		CLIModel:      modelFlag,
-		CLIThinking:   flags.Thinking,
-		ScopePatterns: scopePatterns,
-		Continuing:    resources.ResumePath != "",
-		APIKey:        flags.APIKey,
-	}, settings, services)
-	for _, warning := range selected.Warnings {
-		printModelDiagnostic(warning)
+	if resources.SessionManager == nil && resources.ResumePath != "" {
+		selection := startupSessionSelection{runtimeCWD: cwd, sessionDir: flags.SessionDir, resumePath: resources.ResumePath}
+		if err := selection.loadSession(flags); err != nil {
+			fmt.Fprintf(os.Stderr, "pig --rpc: open selected session: %v\n", err)
+			return 1
+		}
+		resources.SessionManager = selection.manager
 	}
-	model := selected.Model
-	if flags.Thinking == "" {
-		flags.Thinking = selected.Thinking
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pig --rpc: model: %v\n", err)
-		return 1
-	}
+	model := resources.Model
 
 	// ── Extensions ─────────────────────────────────────────────────────────
-	// Load subprocess extensions from CLI -e paths. In RPC mode,
-	// --no-extensions suppresses auto-discovery but -e paths are
-	// still honoured (same semantics as interactive mode).
-	var subprocExts []extension.Extension
-	var subprocHost *subprocess.Host
-
-	var extraExtConfigs = append([]subprocess.ExtConfig(nil), resources.ExtensionConfigs...)
-	var embeddedCells = append([]subprocess.EmbeddedCell(nil), resources.EmbeddedCells...)
-	if activePiglet != nil && binarypiglet.IsPigletBinary() && len(activePiglet.Extensions) > 0 {
-		flags.NoExtensions = true
-	}
-	var subprocBridge *subprocess.UIBridge
-	var loadErrs []error
-	if !flags.NoExtensions || len(extraExtConfigs) > 0 || len(embeddedCells) > 0 {
-		subprocExts, subprocHost, subprocBridge, loadErrs = loadFinalSubprocessExtensions(
-			ctx, cwd, extension.ModeRPC, registry.ModelRegistry, extraExtConfigs,
-			embeddedCells, nil, resources.StartupExtensions,
-		)
-	}
-	// Mirrors upstream main.ts: every extension load error, pre-trust and
-	// final, including tool and flag conflicts, is reported once and ends RPC
-	// startup.
-	if diagnostics := slices.Concat(resources.PreTrustExtensionDiagnostics, extensionLoadDiagnostics(loadErrs), extensionConflictDiagnostics(codingagent.DetectExtensionConflicts(subprocExts))); len(diagnostics) > 0 {
-		if subprocHost != nil {
-			subprocHost.Shutdown("extension load failure")
-		}
-		reportExtensionLoadFailures(diagnostics)
-		return 1
-	}
+	subprocExts, subprocHost, subprocBridge := resources.Extensions, resources.ExtensionHost, resources.ExtensionBridge
 	if subprocHost != nil {
 		defer subprocHost.Shutdown("rpc-exit")
 	}
@@ -390,22 +369,6 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		})
 	}
 
-	// Log loaded extension tools for diagnostics.
-	if len(subprocExts) > 0 {
-		totalTools := 0
-		for _, ext := range subprocExts {
-			totalTools += len(ext.Tools)
-			if len(ext.Tools) > 0 {
-				var names []string
-				for name := range ext.Tools {
-					names = append(names, name)
-				}
-				fmt.Fprintf(os.Stderr, "pig --rpc: extension %q: %d tools: %v\n", ext.Name, len(ext.Tools), names)
-			}
-		}
-		fmt.Fprintf(os.Stderr, "pig --rpc: loaded %d extensions, %d total tools\n", len(subprocExts), totalTools)
-	}
-
 	// An active Piglet uses the generic in-process extension runner for runtime
 	// scoping and read-only inspection. Bare Stock Pig registers no extra command.
 	if activePiglet != nil {
@@ -419,7 +382,7 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	if settings.DefaultTools != nil {
 		defaultToolNames = settings.DefaultTools
 	}
-	var agentToolNames []string
+	agentToolNames := []string{}
 	var allowed map[string]struct{}
 	if !flags.NoBuiltinTools {
 		switch {
@@ -436,17 +399,29 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 				}
 			}
 		default:
-			agentToolNames = append([]string(nil), defaultToolNames...)
+			agentToolNames = slices.Clone(defaultToolNames)
 		}
 	}
-	// Add extension-contributed tool names so the system prompt
-	// mentions them and the agent loop offers them to the LLM.
-	for _, ext := range subprocExts {
-		for name := range ext.Tools {
-			agentToolNames = append(agentToolNames, name)
+	rt, err := coding.NewRuntime(coding.RuntimeOptions{
+		Services:      services,
+		NewExtensions: subprocExts,
+		AbortContext:  ctx,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pig --rpc: runtime: %v\n", err)
+		return 1
+	}
+	defer func() { _ = rt.Close() }()
+	runner := rt.NewExtensionRunner()
+	// Use the runner's first-wins registration order for both the prompt and active loadout, as AgentSession._refreshToolRegistry does.
+	if runner != nil {
+		for _, tool := range runner.Tools() {
+			agentToolNames = append(agentToolNames, tool.Definition.Name)
 		}
 	}
 
+	skillCatalog := codingagent.SlashCommandCatalog{CWD: cwd, AgentDir: agentDir, SourceInfo: resources.SourceInfo}
+	resources.Skills = skillCatalog.WithSkillSources(resources.Skills)
 	promptSkills := promptSkillsFor(resources.Skills)
 	contextFiles := loadContextFiles(cwd, agentDir, flags.NoContextFiles)
 	resolvedPrompts := resolvePromptInputs(cwd, agentDir, flags, resources.ProjectTrusted)
@@ -467,30 +442,17 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	systemPromptSections := prompts.BuildSystemPromptSections(promptOptions)
 	systemPrompt := prompts.BuildDefaultPrompt(promptOptions)
 
-	rt, err := coding.NewRuntime(coding.RuntimeOptions{
-		Services:      services,
-		NewExtensions: subprocExts,
-		AbortContext:  ctx,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pig --rpc: runtime: %v\n", err)
-		return 1
-	}
-	defer func() { _ = rt.Close() }()
-
 	// sessPtr is set after session creation so runtime callbacks can access it.
 	var sessPtr *coding.Session
-	var extensionEvents rpcTaskGroup
 
 	// Wire in-process extension context actions (GetAllTools, SetActiveTools)
 	// so the piglet extension can scope tools during before_agent_start.
 	// Mirrors interactive mode's wireInprocContextActions().
-	runner := rt.NewExtensionRunner()
 	if runner != nil {
 		runner.AddErrorListener(func(err *extension.ExtensionError) {
 			writeRPC(rpcExtensionErrorEvent(err))
 		})
-		runner.SetUIContext(rpcUI)
+		runner.SetUIContext(rpcUI, extension.ModeRPC)
 		// Subprocess dialogs reach rpcUI through the bridge; report their
 		// ui_prompt_start/ui_prompt_end through this runner.
 		if subprocBridge != nil {
@@ -513,20 +475,10 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		bindSessionExtensionActions(runner, subprocBridge, func() *coding.Session { return sessPtr },
 			extension.ContextActions{
 				GetAllTools: func() []extension.ToolInfo {
-					tools := runner.Tools()
-					result := make([]extension.ToolInfo, len(tools))
-					for i, t := range tools {
-						source := "builtin"
-						if s, ok := t.SourceInfo.(string); ok && s != "" {
-							source = s
-						}
-						result[i] = extension.ToolInfo{
-							Name:        t.Definition.Name,
-							Description: t.Definition.Description,
-							SourceInfo:  source,
-						}
+					if sessPtr == nil {
+						return nil
 					}
-					return result
+					return sessPtr.GetAllTools()
 				},
 				GetActiveTools: func() []string {
 					if sessPtr != nil {
@@ -548,29 +500,20 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 					if sessPtr == nil {
 						return // session not created yet; scoping deferred to before_agent_start
 					}
-					allowed := make(map[string]struct{}, len(names))
-					for _, n := range names {
-						allowed[n] = struct{}{}
-					}
-					allTools := sessPtr.Tools()
-					var filtered []agent.AgentTool
-					for _, t := range allTools {
-						if _, ok := allowed[t.Name()]; ok {
-							filtered = append(filtered, t)
-						}
-					}
-					sessPtr.Agent().SetTools(filtered)
+					sessPtr.SetActiveToolsByName(names)
 				},
 				GetFlagValue: func(name string) any {
-					return nil
+					return flags.UnknownFlags[name]
 				},
 				IsProjectTrusted: func() bool {
 					return resources.ProjectTrusted
 				},
-				// RPC mode. Mirrors upstream rpc-mode.ts:320 (`mode: "rpc"`).
-				Mode:          extension.ModeRPC,
 				ModelRegistry: services.Registry(),
+				Shutdown:      func() { shutdownRequested.Store(true) },
 			})
+		if subprocBridge != nil {
+			subprocBridge.SetHostAction("shutdown", func() { shutdownRequested.Store(true) })
+		}
 	}
 
 	sessionDir, err := resolveSessionDir(flags.SessionDir, services.SettingsManager())
@@ -579,21 +522,32 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		return 1
 	}
 	sess, err := rt.New(coding.SessionStartOptions{
-		Model:                model,
-		SystemPrompt:         systemPrompt,
-		SystemPromptSections: systemPromptSections,
-		AllowedTools:         allowed,
-		SkipBuiltinTools:     flags.NoBuiltinTools,
-		SessionDir:           sessionDir,
-		SessionID:            flags.SessionID,
-		NoSession:            flags.NoSession,
-		ResumePath:           resources.ResumePath,
+		SessionManager:        resources.SessionManager,
+		ScopedModels:          extensionScopedModels(services, scopePatterns),
+		Model:                 model,
+		ThinkingLevel:         ai.ThinkingLevel(flags.Thinking),
+		SystemPrompt:          systemPrompt,
+		SystemPromptSections:  systemPromptSections,
+		SystemPromptResources: sessionPromptResources(resolvedPrompts, contextFiles, resources.Skills),
+		AllowedTools:          allowed,
+		SkipBuiltinTools:      flags.NoBuiltinTools,
+		SessionDir:            sessionDir,
+		SessionID:             flags.SessionID,
+		NoSession:             flags.NoSession,
+		ResumePath:            resources.ResumePath,
+		CWDOverride:           flags.sessionCwdOverride,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pig --rpc: session: %v\n", err)
 		return 1
 	}
 	defer func() { _ = sess.Close() }()
+	if flags.Name != "" {
+		if _, err := sess.Inner().AppendSessionInfo(flags.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "pig --rpc: set session name: %v\n", err)
+			return 1
+		}
+	}
 	sessPtr = sess // enable piglet scoping callbacks
 	rpcSetInitialActiveTools(sess, agentToolNames)
 
@@ -604,27 +558,16 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		}
 	}
 	if activePiglet != nil {
-		allTools := sess.Tools()
+		allTools := sess.GetAllTools()
 		infos := make([]piglet.ToolInfo, len(allTools))
 		for i, t := range allTools {
-			source := toolSource[t.Name()]
+			source := toolSource[t.Name]
 			if source == "" {
 				source = "builtin"
 			}
-			infos[i] = piglet.ToolInfo{Name: t.Name(), Source: source}
+			infos[i] = piglet.ToolInfo{Name: t.Name, Source: source}
 		}
-		allowedNames := piglet.ScopeTools(activePiglet, infos)
-		allowedSet := make(map[string]struct{}, len(allowedNames))
-		for _, name := range allowedNames {
-			allowedSet[name] = struct{}{}
-		}
-		var filtered []agent.AgentTool
-		for _, t := range allTools {
-			if _, ok := allowedSet[t.Name()]; ok {
-				filtered = append(filtered, t)
-			}
-		}
-		sess.Agent().SetTools(filtered)
+		sess.SetActiveToolsByName(piglet.ScopeTools(activePiglet, infos))
 	}
 
 	// Wire extension host callbacks for RPC mode.
@@ -642,63 +585,21 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		subprocBridge.SetHostAction("getCommands", func() []subprocess.CommandInfo {
 			return publishedCatalog.Load().slashCatalog().SubprocessCommands()
 		})
-		subprocBridge.SetHostAction("getSessionName", func() string { return sess.SessionName() })
-		subprocBridge.SetHostAction("getSessionID", func() string { return sess.ID() })
-		subprocBridge.SetHostAction("getSessionFile", func() string { return sess.Path() })
-		subprocBridge.SetHostAction("getLeafID", func() string {
-			if leaf := sess.LeafID(); leaf != nil {
-				return *leaf
-			}
-			return ""
-		})
-		subprocBridge.SetHostAction("getEntriesPage", func(cursor, maxBytes int) ([]json.RawMessage, int, bool, string) {
-			entries := sess.Inner().Entries()
-			if cursor < 0 || cursor > len(entries) {
-				cursor = 0
-			}
-			page := make([]json.RawMessage, 0)
-			bytes := 0
-			next := cursor
-			for next < len(entries) {
-				raw := entries[next].Raw()
-				entryBytes := len(raw) + 1
-				if len(page) > 0 && bytes+entryBytes > maxBytes {
-					break
-				}
-				if len(raw) > 0 {
-					page = append(page, json.RawMessage(raw))
-					bytes += entryBytes
-				}
-				next++
-			}
-			leafID := ""
-			if leaf := sess.LeafID(); leaf != nil {
-				leafID = *leaf
-			}
-			return page, next, next < len(entries), leafID
-		})
+		bindSessionReadActions(subprocBridge, func() *coding.Session { return sess }, services.CWD(), sessionDir)
 		// getActiveTools and setActiveTools come from bindSessionExtensionActions
 		// (upstream getActiveToolNames and setActiveToolsByName).
-		subprocBridge.SetHostAction("refreshTools", func() {
-			// No-op in RPC mode: tools don't change dynamically.
-		})
-		subprocBridge.SetHostAction("appendEntry", func(customType string, data any) error {
-			id, err := codingagent.GenerateEntryID()
+		subprocBridge.SetHostAction("appendEntry", func(customType string, data any, direct *subprocess.DirectEntryAppend) error {
+			entry, err := codingagent.AppendExtensionEntry(sess.Inner(), customType, data, direct)
 			if err != nil {
 				return err
 			}
-			entry := codingagent.CustomEntry{
-				SessionEntryBase: codingagent.SessionEntryBase{
-					Type:      "custom",
-					ID:        id,
-					ParentID:  sess.LeafID(),
-					Timestamp: codingagent.RFC3339NowNano(),
-				},
-				CustomType: customType,
-				Data:       data,
+			if direct != nil {
+				// ctx.sessionManager.appendCustomEntry writes the log only;
+				// upstream emits entry_appended for pi.appendEntry alone.
+				return nil
 			}
-			if err := sess.Inner().AppendEntry(entry); err != nil {
-				return err
+			if sessionEventsDetached.Load() {
+				return nil
 			}
 			writeRPC(RPCEntryAppendedEvent{
 				Type: "entry_appended",
@@ -709,35 +610,15 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 			})
 			return nil
 		})
-		subprocBridge.SetHostAction("setSessionName", func(name string) error {
-			if err := sess.SetSessionName(name); err != nil {
-				return err
-			}
-			effectiveName := sess.SessionName()
-			writeRPC(rpcSessionInfoChanged(effectiveName))
-			if runner != nil {
-				extensionEvents.Go(func() {
-					_, _ = runner.Emit(ctx, extension.SessionInfoChangedEvent{
-						Type: codingagent.EventSessionInfoChanged,
-						Name: effectiveName,
-					})
-				})
-			}
-			return nil
-		})
 	}
 
-	// Diagnostic: log actual tool count from the agent.
-	fmt.Fprintf(os.Stderr, "pig --rpc: agent has %d tools (builtins_skipped=%v)\n",
-		len(sess.Agent().Tools()), flags.NoBuiltinTools)
-
-	// Pi's unknown model supports only off. A selected model uses the CLI
-	// preference, which the normal model-resolution path already validates.
-	if model == nil {
-		sess.Agent().SetThinkingLevel(ai.ThinkingOff)
-	} else if flags.Thinking != "" {
-		sess.Agent().SetThinkingLevel(ai.ThinkingLevel(flags.Thinking))
-	}
+	// Publish name changes before the setter response, including extension startup calls.
+	unsubscribeName := sess.Subscribe(func(event agent.AgentEvent) {
+		if name, ok := event.(agent.SessionInfoChangedEvent); ok && !sessionEventsDetached.Load() {
+			writeRPC(rpcSessionInfoChanged(name.Name))
+		}
+	})
+	defer unsubscribeName()
 
 	// Drive the extension session lifecycle in RPC mode. Upstream fires
 	// session_start via session.bindExtensions (rpc-mode.ts:318) after wiring
@@ -745,13 +626,108 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	// previously fired these only in interactive mode, so extensions were
 	// silently skipped under the production `--mode rpc` path. Emitted inline
 	// after binding, with shutdown deferred so it only runs when start did.
+	sess.SetRetryContinuationScheduler(responses.after)
 	sess.EmitSessionStart("startup")
-	defer sess.EmitSessionShutdown("quit")
-	setTerminationShutdownHook(func() { sess.EmitSessionShutdown("quit") })
+	// Upstream shutdown() runs once, on stdin end, ctx.shutdown(), or a
+	// termination signal (rpc-mode.ts:728-744). It removes the signal
+	// handlers, stops writing Session events, and awaits runtimeHost.dispose():
+	// session_shutdown, then AgentSession.dispose, while the Session still runs.
+	// It then flushes stdout, unless the signal is SIGTERM, and exits without
+	// joining the remaining work: dialogs stdin can no longer answer stay
+	// pending, and their commands never respond.
+	terminateProcesses := func() {
+		if subprocHost != nil {
+			subprocHost.TerminateProcesses()
+		}
+	}
+	exitRPC := func(code int) {
+		stdoutClosed.Store(true)
+		terminateProcesses()
+		// Upstream process.exit does not wait for providers or suspended extension callbacks.
+		os.Exit(code)
+	}
+	if subprocHost != nil {
+		subprocHost.SetRuntimeDrainHandler(func() { exitRPC(0) })
+		defer subprocHost.SetRuntimeDrainHandler(nil)
+	}
+	forceSignal := func(sig os.Signal) {
+		terminateProcesses()
+		dieBySignal(sig)
+	}
+	var forced atomic.Pointer[forcedTermination]
+	defer func() { forced.Load().Stop() }()
+	shutdownInvoked := make(chan struct{})
+	shutdownContext := invocation.WithAcknowledgment(context.Background(), func() { close(shutdownInvoked) })
+	shutdown := newRPCShutdown(
+		func() { forced.Store(watchForcedTermination(forceSignal)) },
+		func() {
+			// Upstream writes each Session event when it is published, so the
+			// events already published reach stdout before it unsubscribes.
+			if eventForwarderRunning.Load() {
+				_ = sess.FlushEvents(context.Background())
+			}
+			sessionEventsDetached.Store(true)
+		},
+		func() {
+			_, _ = runner.Emit(shutdownContext, extension.SessionShutdownEvent{Type: "session_shutdown", Reason: "quit"})
+			invocation.Acknowledge(shutdownContext)
+			sess.Dispose()
+		},
+		func() {
+			select {
+			case <-rpcUI.PendingRequest():
+				return
+			case <-responses.idle():
+			}
+			// flushRawStdout lets the aborted run's in-process work (its
+			// turn_end boundaries, agent_settled and the errors they report)
+			// finish before the process exits. Work waiting on a dialog never
+			// finishes there.
+			settleCtx, stopSettle := context.WithCancel(context.Background())
+			settleWatcherDone := make(chan struct{})
+			defer func() { stopSettle(); <-settleWatcherDone }()
+			go func() {
+				defer close(settleWatcherDone)
+				select {
+				case <-rpcUI.PendingRequest():
+					stopSettle()
+				case <-settleCtx.Done():
+				}
+			}()
+			_ = sess.WaitForIdle(settleCtx)
+		},
+		exitRPC,
+		forceSignal,
+	)
+	defer shutdown.finish()
+	// checkRequestedShutdown is rpc-mode.ts checkShutdownRequested. It runs on
+	// the command loop and the event forwarder, so shutdown runs apart from
+	// them.
+	var shutdownTasks sync.WaitGroup
+	defer shutdownTasks.Wait()
+	scheduleRequestedShutdown := func() bool {
+		if !shutdownRequested.Load() {
+			return false
+		}
+		shutdownTasks.Go(shutdown.requested)
+		return true
+	}
+	checkRequestedShutdown := func() {
+		if scheduleRequestedShutdown() {
+			<-shutdownInvoked
+		}
+	}
+	setTerminationShutdownHook(func() { shutdown.signal(syscall.Signal(receivedTerminationSignal.Load())) })
 	defer setTerminationShutdownHook(nil)
-	if commandCatalog.extendFromExtensions(ctx, runner, "startup") {
+	skillsChanged, resourceErr := commandCatalog.extendFromExtensions(ctx, runner, "startup")
+	if resourceErr != nil {
+		fmt.Fprintln(os.Stderr, resourceErr)
+		return 1
+	}
+	if skillsChanged {
 		promptOptions.Skills = promptSkillsFor(commandCatalog.skills)
 		sess.SetSystemPromptSections(prompts.BuildSystemPromptSections(promptOptions))
+		sess.SetSystemPromptResources(*sessionPromptResources(resolvedPrompts, contextFiles, commandCatalog.skills))
 	}
 	publishedCatalog.Store(new(commandCatalog))
 
@@ -767,7 +743,7 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	var bashWG sync.WaitGroup
 	var commandWG sync.WaitGroup
 
-	handleCycleModel := func(id string, currentSession *coding.Session, turn *rpcResponseTurn) {
+	handleCycleModel := func(id rpcRequestID, currentSession *coding.Session, turn *rpcResponseTurn) {
 		models, err := rpcAvailableModels(services, currentSession.Model())
 		if err != nil {
 			turn.complete(rpcError(id, "cycle_model", err.Error()))
@@ -810,14 +786,25 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		}
 	}
 
-	// settlePrompt is upstream `await session.abort()`: the active run stops,
-	// whoever started it, and its agent_settled is on the wire before the
-	// caller answers.
-	settlePrompt := func() {
-		sess.RequestAbort()
+	var inputTurn *rpcResponseTurn
+	waitPrompt := func() {
 		promptWG.Wait()
 		_ = sess.WaitForIdle(context.Background())
 		_ = sess.FlushEvents(ctx)
+	}
+	// settlePrompt is upstream `await session.abort()`: release the admitted input turn while joining work so queued Session reactions can complete before the response.
+	settlePrompt := func() {
+		sess.RequestAbort()
+		currentTurn := inputTurn
+		if currentTurn != nil {
+			inputTurn = nil
+			currentTurn.end()
+			defer func() {
+				currentTurn.begin()
+				inputTurn = currentTurn
+			}()
+		}
+		waitPrompt()
 	}
 	settleSessionWork := func() {
 		commandWG.Wait()
@@ -830,10 +817,15 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 	eventsDone := make(chan struct{})
 	eventConversionErr := make(chan error, 1)
 
+	eventForwarderRunning.Store(true)
 	go func() {
 		defer close(eventsDone)
+		defer eventForwarderRunning.Store(false)
 		for ev := range sess.Events() {
-			if coding.AcknowledgeEvent(ev) {
+			if _, alreadyPublished := ev.(agent.SessionInfoChangedEvent); alreadyPublished {
+				continue
+			}
+			if coding.AcknowledgeEvent(ev) || sessionEventsDetached.Load() {
 				continue
 			}
 			converted, err := rpcAgentEvent(ev)
@@ -846,6 +838,10 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 			for _, outEvent := range converted {
 				writeRPC(outEvent)
 			}
+			if _, settled := ev.(agent.AgentSettledEvent); settled {
+				// The forwarder must keep acknowledging the shutdown flush barrier.
+				scheduleRequestedShutdown()
+			}
 		}
 	}()
 
@@ -853,8 +849,10 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 
 	inputLines := make(chan [][]byte, 64)
 	inputDone := make(chan error, 1)
+	// loopIdle is closed when the command loop has dispatched every line read
+	// before stdin ended.
+	loopIdle := make(chan struct{})
 	go func() {
-		defer close(inputLines)
 		err := rpcclient.ReadJSONLBatches(os.Stdin, func(lines [][]byte) bool {
 			select {
 			case inputLines <- lines:
@@ -863,17 +861,32 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 				return false
 			}
 		})
+		close(inputLines)
+		if subprocHost != nil {
+			subprocHost.EndInput()
+		}
 		if ctx.Err() != nil {
 			inputDone <- nil
 			return
 		}
-		rpcUI.Close()
+		// Upstream stdin end runs shutdown() once every line was dispatched,
+		// while a command may still wait on a dialog stdin can no longer
+		// answer.
+		select {
+		case <-loopIdle:
+		case <-rpcUI.PendingRequest():
+		case <-shutdown.Started():
+		case <-ctx.Done():
+		}
+		if ctx.Err() == nil {
+			shutdown.inputEnd()
+		}
 		inputDone <- err
 	}()
 
 	admission := &rpcAdmission{
 		ctx: ctx, turn: responses, session: sess, runner: runner, catalog: commandCatalog,
-		write: writeImmediate, runs: &promptWG,
+		write: writeImmediate, runs: &promptWG, commandDone: checkRequestedShutdown,
 		validateModel: func() error {
 			model := sess.Model()
 			if model == nil {
@@ -890,12 +903,17 @@ func runRPCMode(ctx context.Context, flags CLIFlags, activePiglet *piglet.Piglet
 		},
 	}
 	var inputBatch [][]byte
-	var inputTurn *rpcResponseTurn
+	commandChecked := true
 commandLoop:
 	for {
 		if len(inputBatch) == 0 && inputTurn != nil {
 			inputTurn.end()
 			inputTurn = nil
+		}
+		// Upstream checks for ctx.shutdown() once after each handled command.
+		if !commandChecked {
+			checkRequestedShutdown()
+			commandChecked = true
 		}
 		if ctx.Err() != nil {
 			break commandLoop
@@ -906,6 +924,7 @@ commandLoop:
 				break commandLoop
 			case next, ok := <-inputLines:
 				if !ok {
+					close(loopIdle)
 					break commandLoop
 				}
 				inputBatch = next
@@ -922,8 +941,7 @@ commandLoop:
 			// rpc-mode.ts:handleInputLine catch block. Translate Go json
 			// error wording to upstream's JS SyntaxError wording so the wire
 			// shape matches byte-for-byte across binaries.
-			writeImmediate(rpcError("", "parse",
-				fmt.Sprintf("Failed to parse command: %s", jsifyJSONErrorMessage(parseErr))))
+			writeImmediate(rpcParseError(line, parseErr))
 			continue
 		}
 
@@ -932,6 +950,7 @@ commandLoop:
 			continue
 		}
 
+		commandChecked = false
 		switch env.Type {
 		// ── prompt ──────────────────────────────────────────────────────
 		case "prompt":
@@ -942,14 +961,24 @@ commandLoop:
 			}
 			if name, args, ok := commandCatalog.extensionCommand(cmd.Message); ok {
 				admission.command(env.ID, name, args)
+				commandChecked = true
 				continue
 			}
 			admission.prompt(env.ID, cmd)
 
 		// ── abort ────────────────────────────────────────────────────────
 		case "abort":
-			settlePrompt()
-			writeRPC(rpcSuccess(env.ID, "abort", nil))
+			sess.RequestAbort()
+			rpcAwaitWork(admission, true, func() (struct{}, error) {
+				waitPrompt()
+				return struct{}{}, nil
+			}).then(func(_ struct{}, err error) {
+				if err != nil {
+					writeRPC(rpcError(env.ID, "abort", err.Error()))
+				} else {
+					writeRPC(rpcSuccess(env.ID, "abort", nil))
+				}
+			})
 
 		case "clear_queue":
 			steering, followUp := sess.ClearQueue()
@@ -1016,7 +1045,7 @@ commandLoop:
 
 		// ── get_state ────────────────────────────────────────────────────
 		case "get_state":
-			compactionEnabled := services.SettingsManager().GetCompactionSettings().Enabled
+			compactionEnabled := services.SettingsManager().GetCompactionEnabled()
 			state := RPCSessionState{
 				Model:                 rpcModelValue(sess.Model()),
 				ThinkingLevel:         string(sess.ThinkingLevel()),
@@ -1060,6 +1089,10 @@ commandLoop:
 				writeRPC(rpcError(env.ID, "set_model", err.Error()))
 				continue
 			}
+			if err := sess.FlushEvents(ctx); err != nil {
+				writeRPC(rpcError(env.ID, "set_model", err.Error()))
+				continue
+			}
 			writeRPC(rpcSuccess(env.ID, "set_model", rpcModelValue(newModel)))
 
 		case "cycle_model":
@@ -1076,8 +1109,13 @@ commandLoop:
 			customInstructions := cmd.CustomInstructions
 			currentSession := sess
 			commandWG.Go(func() {
-				settlePrompt()
+				// The input loop owns its response turn; this worker only aborts and joins Session work.
+				currentSession.RequestAbort()
+				waitPrompt()
 				result, err := currentSession.CompactResult(ctx, customInstructions)
+				if flushErr := currentSession.FlushEvents(ctx); err == nil {
+					err = flushErr
+				}
 				if err != nil {
 					writeRPC(rpcError(commandID, "compact", err.Error()))
 					return
@@ -1127,6 +1165,10 @@ commandLoop:
 				writeRPC(rpcError(env.ID, "set_thinking_level", err.Error()))
 				continue
 			}
+			if err := sess.FlushEvents(ctx); err != nil {
+				writeRPC(rpcError(env.ID, "set_thinking_level", err.Error()))
+				continue
+			}
 			writeRPC(rpcSuccess(env.ID, "set_thinking_level", nil))
 
 		// ── cycle_thinking_level ─────────────────────────────────────────────
@@ -1140,6 +1182,10 @@ commandLoop:
 			currentIndex := max(slices.Index(levels, current), 0)
 			nextLevel := levels[(currentIndex+1)%len(levels)]
 			if err := sess.SetThinkingLevel(nextLevel); err != nil {
+				writeRPC(rpcError(env.ID, "cycle_thinking_level", err.Error()))
+				continue
+			}
+			if err := sess.FlushEvents(ctx); err != nil {
 				writeRPC(rpcError(env.ID, "cycle_thinking_level", err.Error()))
 				continue
 			}
@@ -1195,7 +1241,7 @@ commandLoop:
 			}
 			// Run bash in a goroutine (may block for a long time).
 			bashWG.Add(1)
-			go func(id, command string, excludeFromContext bool) {
+			go func(id rpcRequestID, command string, excludeFromContext bool) {
 				defer bashWG.Done()
 				// Upstream rpc-mode awaits emitUserBash first: a result override is
 				// recorded and returned without running the command, and a failed
@@ -1206,15 +1252,21 @@ commandLoop:
 					return
 				}
 				if override != nil {
-					sess.RecordBashResult(command, *override, excludeFromContext)
+					if err := sess.RecordBashResult(command, *override, excludeFromContext); err != nil {
+						turn.complete(rpcError(id, "bash", err.Error()))
+						return
+					}
 					turn.complete(rpcSuccess(id, "bash", RPCBashResult(*override)))
 					return
 				}
-				result, err := sess.ExecuteBashWithOperations(ctx, command, excludeFromContext, func(delta string) {
-					writeRPC(RPCBashExecutionUpdate{Type: "bash_execution_update", ID: id, Delta: delta})
-				}, operations)
+				result, err := sess.ExecuteBashWithOperations(ctx, command, excludeFromContext, nil, operations, rpcBashUpdateID(id))
+				flushErr := sess.FlushEvents(ctx)
 				if err != nil {
 					turn.complete(rpcError(id, "bash", err.Error()))
+					return
+				}
+				if flushErr != nil {
+					turn.complete(rpcError(id, "bash", flushErr.Error()))
 					return
 				}
 				turn.complete(rpcSuccess(id, "bash", RPCBashResult{
@@ -1238,7 +1290,7 @@ commandLoop:
 				writeRPC(rpcError(env.ID, "set_session_name", err.Error()))
 				continue
 			}
-			name := strings.TrimSpace(cmd.Name)
+			name := widthx.JSTrim(cmd.Name)
 			if name == "" {
 				writeRPC(rpcError(env.ID, "set_session_name", "Session name cannot be empty"))
 				continue
@@ -1246,16 +1298,6 @@ commandLoop:
 			if err := sess.SetSessionName(name); err != nil {
 				writeRPC(rpcError(env.ID, "set_session_name", err.Error()))
 				continue
-			}
-			name = sess.SessionName()
-			writeRPC(rpcSessionInfoChanged(name))
-			if runner != nil {
-				extensionEvents.Go(func() {
-					_, _ = runner.Emit(ctx, extension.SessionInfoChangedEvent{
-						Type: codingagent.EventSessionInfoChanged,
-						Name: name,
-					})
-				})
 			}
 			writeRPC(rpcSuccess(env.ID, "set_session_name", nil))
 
@@ -1269,15 +1311,11 @@ commandLoop:
 				writeRPC(rpcError(env.ID, "export_html", err.Error()))
 				continue
 			}
-			if sess.Path() == "" {
-				writeRPC(rpcError(env.ID, "export_html", "Cannot export an in-memory session"))
-				continue
-			}
 			var registered []extension.RegisteredTool
 			if runner != nil {
 				registered = runner.Tools()
 			}
-			outputPath, err := codingexport.ExportFromFileWithTools(sess.Path(), cmd.OutputPath, registered, cwd)
+			outputPath, err := codingagent.ExportSessionToHTML(sess.Path(), cmd.OutputPath, registered, cwd)
 			if err != nil {
 				writeRPC(rpcError(env.ID, "export_html", err.Error()))
 				continue
@@ -1450,25 +1488,28 @@ commandLoop:
 			writeRPC(rpcSuccess(env.ID, "set_follow_up_mode", nil))
 
 		default:
-			// Upstream (0.79.10): error(id, unknownCommand.type, `Unknown command: ${unknownCommand.type}`)
-			// 0.79.x changed this from error(undefined, ...) to echo the
-			// request id so clients can correlate the error response.
-			writeRPC(rpcError(env.ID, env.Type,
-				fmt.Sprintf("Unknown command: %s", env.Type)))
+			writeRPC(rpcUnknownCommand(env))
 		}
 	}
 
 	if inputTurn != nil {
 		inputTurn.end()
+		inputTurn = nil
 	}
 
 	// Detach input on cancellation. The stdin reader belongs to the process, not the Session; process exit releases a pending OS read just as Pi pauses stdin before exiting.
+	// The reader reports stdin end only after the runtime was disposed.
+	var scanErr error
 	select {
-	case scanErr := <-inputDone:
-		if scanErr != nil && !errors.Is(scanErr, io.EOF) {
-			writeRPC(RPCErrorEvent{Type: "error", Message: fmt.Sprintf("stdin read error: %v", scanErr)})
-		}
+	case scanErr = <-inputDone:
 	case <-ctx.Done():
+		select {
+		case scanErr = <-inputDone:
+		default:
+		}
+	}
+	if scanErr != nil && !errors.Is(scanErr, io.EOF) {
+		writeRPC(RPCErrorEvent{Type: "error", Message: fmt.Sprintf("stdin read error: %v", scanErr)})
 	}
 
 	// Stop admitting or blocking on extension work before joining commands.
@@ -1480,7 +1521,6 @@ commandLoop:
 	responses.begin()
 	responses.end()
 	settleSessionWork()
-	extensionEvents.CloseAndWait()
 
 	// Session Close drains and closes the events channel.
 	_ = sess.Close()
@@ -1702,24 +1742,6 @@ func rpcTreeNode(node *codingagent.SessionTreeNode) rpcSessionTreeNode {
 		out.Children[i] = rpcTreeNode(child)
 	}
 	return out
-}
-
-// jsifyJSONErrorMessage rewrites Go encoding/json error wording so it matches
-// the JavaScript SyntaxError wording emitted by upstream pi's V8-based parser.
-// Only the surface texts that flow through the RPC `parse` error path are
-// translated: every other error path passes upstream's own messages through.
-//
-// Locked by parity scenarios rpc/03-rpc-state-setters.toml and
-// rpc/04-rpc-jsonl-framing.toml. See `Failed to parse command: ...`.
-func jsifyJSONErrorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	msg := err.Error()
-	if msg == "unexpected end of JSON input" {
-		return "Unexpected end of JSON input"
-	}
-	return msg
 }
 
 // rpcUserBashOverride dispatches user_bash for an RPC bash command. It returns

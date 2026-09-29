@@ -18,7 +18,7 @@ func ConvertToLLM(msgs []AgentMessage, model *ai.Model) []ai.Message {
 		case m.System != nil:
 			out = append(out, *m.System)
 		case m.User != nil:
-			out = append(out, ai.UserMessage{Content: ai.UserContentBlocks(m.User.Content), Timestamp: m.User.Timestamp})
+			out = append(out, m.User.LLMMessage())
 		case m.Assistant != nil:
 			message := m.Assistant.LLMMessage()
 			if len(message.Content) == 0 {
@@ -81,10 +81,14 @@ func customMessageContent(content any) (ai.UserContentBlocks, bool) {
 	if json.Unmarshal(raw, &decoded) != nil || decoded.User == nil {
 		return nil, false
 	}
-	if decoded.User.Content == nil {
+	switch content := decoded.User.Content.(type) {
+	case ai.UserText:
+		return ai.UserContentBlocks{ai.TextContent{Text: string(content)}}, true
+	case ai.UserContentBlocks:
+		return content, true
+	default:
 		return ai.UserContentBlocks{}, true
 	}
-	return ai.UserContentBlocks(decoded.User.Content), true
 }
 
 // customTimestamp returns a custom message's timestamp in Unix milliseconds,
@@ -102,6 +106,15 @@ func customTimestamp(m map[string]any) int64 {
 		return value
 	}
 	return 0
+}
+
+// LLMMessage retains the user content variant and normalizes an omitted Go content value to an empty array.
+func (m *UserMessage) LLMMessage() ai.UserMessage {
+	content := m.Content
+	if content == nil {
+		content = ai.UserContentBlocks{}
+	}
+	return ai.UserMessage{Content: content, Timestamp: m.Timestamp}
 }
 
 // LLMMessage returns the provider-facing form of an assistant message. It

@@ -69,10 +69,9 @@ var extendedThinkingLevels = []ThinkingLevel{
 	ThinkingMax,
 }
 
-// GetSupportedThinkingLevels returns the model's supported thinking levels.
-// Catalog models use empty MaxThinking for non-reasoning models.
+// GetSupportedThinkingLevels returns the model's supported thinking levels. Selected model reasoning metadata or a native MaxThinking capability enables reasoning.
 func GetSupportedThinkingLevels(m *Model) []ThinkingLevel {
-	if m == nil || m.Capabilities.MaxThinking == "" {
+	if m == nil || !m.ProviderMeta.Reasoning && m.Capabilities.MaxThinking == "" {
 		return []ThinkingLevel{ThinkingOff}
 	}
 	return slices.DeleteFunc(slices.Clone(extendedThinkingLevels), func(level ThinkingLevel) bool {
@@ -119,14 +118,11 @@ func ClampThinkingLevel(m *Model, level ThinkingLevel) ThinkingLevel {
 	return available[0]
 }
 
-// ModelsAreEqual returns true if both models share the same ID and provider.
+// ModelsAreEqual compares model IDs and declared provider IDs independently of backend construction. Native models without provider metadata use their backend's provider ID.
 // Mirrors upstream models.ts:modelsAreEqual.
 func ModelsAreEqual(a, b *Model) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.Provider == nil || b.Provider == nil {
-		return false
-	}
-	return a.ID == b.ID && a.Provider.ID() == b.Provider.ID()
+	return a.ID == b.ID && modelProviderID(a) == modelProviderID(b)
 }

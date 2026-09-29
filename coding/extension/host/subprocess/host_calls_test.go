@@ -18,6 +18,7 @@ import (
 // raw call frames as the extension would.
 type callOrderFixture struct {
 	t      *testing.T
+	conn   *Conn
 	ext    net.Conn
 	writeM sync.Mutex
 }
@@ -46,7 +47,7 @@ func newCallOrderFixture(t *testing.T, handle func(call *CallPayload) (*CallResu
 		_ = extSide.Close()
 		<-conn.Done()
 	})
-	return &callOrderFixture{t: t, ext: extSide}
+	return &callOrderFixture{t: t, ext: extSide, conn: conn}
 }
 
 func (f *callOrderFixture) call(id, method, parent string, args any) {
@@ -132,6 +133,10 @@ func TestNestedCallsRunWhileAnEarlierCallWaits(t *testing.T) {
 		return &CallResultPayload{}, nil
 	})
 	f.call("c1", "setActiveTools", "", map[string]any{})
+	// The nested call's parent is an outstanding host request, not a completed or fabricated generation.
+	f.conn.pendingMu.Lock()
+	f.conn.pending["r7"] = make(chan *Envelope, 1)
+	f.conn.pendingMu.Unlock()
 	f.call("c2", "ui.notify", "r7", map[string]any{})
 	waitSignal(t, nested, "nested call")
 	waitSignal(t, outerDone, "outer call")

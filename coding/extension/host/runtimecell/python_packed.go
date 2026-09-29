@@ -180,7 +180,7 @@ func findPythonSDKRoot() (string, error) {
 
 func renderPythonRunner(extensions []PythonExtension, sdkRoot string) string {
 	var b strings.Builder
-	b.WriteString("import importlib\nimport os\nimport sys\nimport threading\n\n")
+	b.WriteString("import importlib.util\nimport hashlib\nimport os\nimport sys\nimport threading\n\n")
 	b.WriteString("sys.dont_write_bytecode = True\nos.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')\n\n")
 	fmt.Fprintf(&b, "sys.path.insert(0, %q)\n", filepath.ToSlash(sdkRoot))
 	for _, ext := range extensions {
@@ -188,14 +188,14 @@ func renderPythonRunner(extensions []PythonExtension, sdkRoot string) string {
 	}
 	b.WriteString("\nITEMS = [\n")
 	for _, ext := range extensions {
-		fmt.Fprintf(&b, "    (%q, %q, %q, %q),\n", ext.Name, SocketEnvName(ext.Name), ext.Package, ext.Factory)
+		fmt.Fprintf(&b, "    (%q, %q, %q, %q, %q),\n", ext.Name, SocketEnvName(ext.Name), ext.Package, ext.Factory, filepath.ToSlash(ext.Root))
 	}
 	b.WriteString("]\n\n")
-	b.WriteString("def _run(name, env, module_name, factory_name):\n")
+	b.WriteString("def _run(name, env, module_name, factory_name, root):\n")
 	b.WriteString("    sock = os.environ.get(env)\n")
 	b.WriteString("    if not sock and len(ITEMS) == 1:\n        sock = os.environ.get('PIG_EXT_SOCKET')\n")
 	b.WriteString("    if not sock:\n        raise RuntimeError(f'{env} not set for {name}')\n")
-	b.WriteString("    mod = importlib.import_module(module_name)\n")
+	b.WriteString("    path = os.path.join(root, *module_name.split('.'))\n    path = os.path.join(path, '__init__.py') if os.path.isdir(path) else path + '.py'\n    key = '_pig_cell_' + hashlib.sha256((root + ':' + module_name).encode()).hexdigest()\n    spec = importlib.util.spec_from_file_location(key, path, submodule_search_locations=[os.path.dirname(path)])\n    mod = importlib.util.module_from_spec(spec)\n    sys.modules[key] = mod\n    spec.loader.exec_module(mod)\n")
 	b.WriteString("    ext = getattr(mod, factory_name)()\n")
 	b.WriteString("    ext.run_with_socket(sock)\n\n")
 	b.WriteString(pythonRunnerFailureReport)

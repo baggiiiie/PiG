@@ -1,0 +1,40 @@
+# Upstream evidence: Pi 0.87.1 editor.ts:2357-2388 rejects its awaited query;
+# interactive-mode.ts:4205-4237,4266-4268 routes the uncaught exception to exit 1.
+# A direct Pi probe prints this error and exits rather than retaining an editable prompt.
+# Compare the complete error headline and exit status. The excluded stack frames
+# describe different host languages and bridge call sites; the source-stack retention
+# guard is TestAutocompleteFailureReachesUncaughtCrash.
+name = "12-extension-wrapper-error"
+description = "A rejected autocomplete provider reaches the crash owner rather than becoming an empty suggestion list."
+covers = ["packages/coding-agent/src/modes/interactive/interactive-mode.ts", "packages/tui/src/components/editor.ts"]
+tags = ["fast", "hermetic", "tui"]
+driver = "interactive-tmux"
+
+[tmux]
+width = 100
+height = 35
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 30
+capture_start = "Error: BR25_AUTOCOMPLETE_ERROR"
+capture_end = "Error: BR25_AUTOCOMPLETE_ERROR"
+
+[[tmux.steps]]
+keys = ["/boom"]
+wait_contains = ["BR25_AUTOCOMPLETE_ERROR"]
+wait_timeout_seconds = 10
+
+[env]
+pig = ["PIG_CODING_AGENT_DIR=../selectors/testdata/dialogs-default"]
+pi = ["PI_CODING_AGENT_DIR=../selectors/testdata/dialogs-default"]
+pig_extensions = ["testdata/wrapper-error.ts"]
+pi_extensions = ["testdata/wrapper-error.ts"]
+pig_args = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--session-dir", "{{TEMP}}/sessions"]
+
+[assert]
+both_reach_ready = true
+both_contain = ["Error: BR25_AUTOCOMPLETE_ERROR"]
+exit_code = 1
+escaped_output_equal = true
+runs = 3

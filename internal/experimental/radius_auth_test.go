@@ -16,7 +16,7 @@ import (
 const testConnectionID = "00000000-0000-4000-8000-000000000002"
 const testServerID = "00000000-0000-4000-8000-000000000001"
 
-// The pinned experimental-radius-relay.test.ts requires this exact multiplexing envelope.
+// .upstream/v0.87.1/packages/coding-agent/test/experimental-radius-relay.test.ts:104 — matches the Radius multiplexing envelope.
 func TestRelayDataFrameEnvelope(t *testing.T) {
 	payload := []byte{0, 1, 2, 255}
 	frame, err := EncodeRelayDataFrame(testConnectionID, payload)

@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 )
 
 // Kind is the transport-independent source category.
@@ -27,9 +29,7 @@ const (
 	KindContributed Kind = "contributed"
 )
 
-// BarePolicy controls how a source without an explicit scheme/path marker is
-// interpreted at a boundary. Package install uses BareNPM for upstream parity;
-// piglets require explicit typed strings.
+// BarePolicy controls how a source without an explicit scheme/path marker is interpreted. Each caller selects local, npm, or rejection semantics.
 type BarePolicy uint8
 
 const (
@@ -66,12 +66,14 @@ type Ref struct {
 }
 
 var (
-	schemePattern  = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
-	npmSpecPattern = regexp.MustCompile(`^(@?[^@\s]+(?:/[^@\s]+)?)(?:@([^\s]+))?$`)
+	schemePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+	// Selectors retain npm range whitespace; Pi's regexp dot excludes JavaScript line terminators.
+	// upstream: packages/coding-agent/src/core/package-manager.ts:parseNpmSpec
+	npmSpecPattern = regexp.MustCompile(`^(@?[^@\s]+(?:/[^@\s]+)?)(?:@([^\r\n\x{2028}\x{2029}]+))?$`)
 	windowsPath    = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 )
 
-// Parse validates and classifies input without materializing it.
+// Parse validates and classifies input without materializing it. npm selectors retain spaces and tabs used by comparator sets, hyphen ranges, and unions.
 func Parse(input string, opts Options) (Ref, error) {
 	raw := strings.TrimSpace(input)
 	if raw == "" {
@@ -94,6 +96,15 @@ func Parse(input string, opts Options) (Ref, error) {
 	}
 	if isGitInput(raw) {
 		return parseGit(raw)
+	}
+	// Pi package-manager.ts:1446-1470 treats bare SCP spelling as a local path, not a source scheme.
+	if opts.Bare == BareLocal && strings.HasPrefix(raw, "git@") {
+		return Ref{Raw: raw, Kind: KindLocal, Locator: raw}, nil
+	}
+
+	// Pi's isLocalPath (paths.ts:50-64) makes a file: source local; its path is the URL's file path.
+	if strings.HasPrefix(raw, "file:") {
+		return Ref{Raw: raw, Kind: KindLocal, Locator: raw}, nil
 	}
 
 	if scheme, locator, ok := strings.Cut(raw, ":"); ok {
@@ -143,6 +154,14 @@ func (r Ref) Identity(baseDir string) (string, error) {
 		return r.Scheme + ":" + r.Locator, nil
 	case KindLocal:
 		path := r.Locator
+		if strings.HasPrefix(path, "file://") {
+			// package-manager.ts:1375-1393: a file: source keys as local:<resolvePath(path)>.
+			resolved, err := resolvepath.Resolve(path, baseDir)
+			if err != nil {
+				return "", fmt.Errorf("resolve local source %q: %w", r.Locator, err)
+			}
+			return "local:" + resolved, nil
+		}
 		if rest, ok := homeRelative(path); ok {
 			home, err := os.UserHomeDir()
 			if err != nil {

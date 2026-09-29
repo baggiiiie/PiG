@@ -25,9 +25,12 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	semver "github.com/Masterminds/semver/v3"
+	"github.com/gofrs/flock"
 
+	"github.com/MichaelKinsy/PiG/internal/managementhttp"
 	"github.com/MichaelKinsy/PiG/internal/ownerfile"
 )
 
@@ -235,7 +238,7 @@ func validateUpdateURL(raw string) (*url.URL, error) {
 	return nil, fmt.Errorf("update URL %s must use HTTPS; loopback HTTP requires PIG_UPDATE_ALLOW_LOOPBACK_HTTP=1", raw)
 }
 
-func doUpdateRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+func doUpdateRequest(client *http.Client, req *http.Request, retryOptions ...managementhttp.FetchRetryOptions) (*http.Response, error) {
 	trustedClient, err := clientWithUpdateTransportCA(client)
 	if err != nil {
 		return nil, err
@@ -256,6 +259,9 @@ func doUpdateRequest(client *http.Client, req *http.Request) (*http.Response, er
 			return previousCheck(next, via)
 		}
 		return nil
+	}
+	if len(retryOptions) > 0 {
+		return managementhttp.FetchWithRetry(&clone, req, retryOptions[0])
 	}
 	return clone.Do(req)
 }
@@ -424,9 +430,13 @@ func CheckForBinaryUpdate(ctx context.Context, client *http.Client, currentVersi
 	}
 }
 
-// FetchUpdateManifest reads, authenticates, and parses the exact update
-// manifest at rawURL.
-func FetchUpdateManifest(ctx context.Context, client *http.Client, rawURL string) (*UpdateManifest, error) {
+// FetchUpdateManifestOptions selects explicit-update transport retries. Startup checks leave Retry false.
+type FetchUpdateManifestOptions struct {
+	Retry bool
+}
+
+// FetchUpdateManifest reads, authenticates, and parses the exact update manifest at rawURL. Explicit updates retry transport failures and transient HTTP statuses twice within one version-check budget; authentication and parsing failures are terminal.
+func FetchUpdateManifest(ctx context.Context, client *http.Client, rawURL string, options ...FetchUpdateManifestOptions) (*UpdateManifest, error) {
 	manifestURL, err := validateUpdateURL(rawURL)
 	if err != nil {
 		return nil, err
@@ -435,7 +445,13 @@ func FetchUpdateManifest(ctx context.Context, client *http.Client, rawURL string
 	if err != nil {
 		return nil, err
 	}
-	resp, err := doUpdateRequest(client, req)
+	maxRetries := 0
+	if len(options) > 0 && options[0].Retry {
+		// upstream: packages/coding-agent/src/utils/version-check.ts:getLatestPiRelease
+		maxRetries = 2
+	}
+	// upstream: packages/coding-agent/src/utils/version-check.ts:DEFAULT_VERSION_CHECK_TIMEOUT_MS
+	resp, err := doUpdateRequest(client, req, managementhttp.FetchRetryOptions{MaxRetries: &maxRetries, Timeout: 10000 * time.Millisecond})
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +476,9 @@ func FetchUpdateManifest(ctx context.Context, client *http.Client, rawURL string
 		// header; they publish the same signature beside the manifest.
 		// The sidecar extends the manifest's path; a query string stays a query.
 		signatureURL := *manifestURL
+		// Extend the escaped resource path as well, so encoded separators remain part of the same asset name.
+		signatureURL.RawPath = signatureURL.EscapedPath() + ".sig"
 		signatureURL.Path += ".sig"
-		signatureURL.RawPath = ""
 		signature, err = fetchDetachedSignature(ctx, client, signatureURL.String())
 		if err != nil {
 			return nil, err
@@ -543,7 +560,7 @@ func SelfReplace(ctx context.Context, client *http.Client, bin UpdateBinary) err
 // SelfReplaceAt downloads bin, verifies its SHA256, and atomically replaces the
 // executable at exePath. It is the standalone-tier replacement entry point used
 // after tier resolution has proven exePath. Unix-only: on Windows it returns an
-// error directing the user to reinstall.
+// error directing the user to reinstall. Concurrent replacements of the same executable fail before downloading.
 func SelfReplaceAt(ctx context.Context, client *http.Client, bin UpdateBinary, exePath string) error {
 	return selfReplaceAt(ctx, client, bin, exePath, nil)
 }
@@ -551,7 +568,7 @@ func SelfReplaceAt(ctx context.Context, client *http.Client, bin UpdateBinary, e
 // SelfReplaceAtWithCommit replaces exePath and then commits its ownership
 // metadata. If commit fails, the previous executable is restored before the
 // error returns, so a failed receipt update cannot strand a new binary with
-// stale provenance.
+// stale provenance. Concurrent replacements of the same executable fail before downloading; the installation lock remains held through commit or rollback.
 func SelfReplaceAtWithCommit(
 	ctx context.Context,
 	client *http.Client,
@@ -565,7 +582,7 @@ func SelfReplaceAtWithCommit(
 	return selfReplaceAt(ctx, client, bin, exePath, commit)
 }
 
-func selfReplaceAt(ctx context.Context, client *http.Client, bin UpdateBinary, exePath string, commit func() error) error {
+func selfReplaceAt(ctx context.Context, client *http.Client, bin UpdateBinary, exePath string, commit func() error) (resultErr error) {
 	if runtime.GOOS == "windows" {
 		return fmt.Errorf("in-place self-update is not supported on Windows; reinstall from the update source")
 	}
@@ -579,6 +596,24 @@ func selfReplaceAt(ctx context.Context, client *http.Client, bin UpdateBinary, e
 	if _, err := hex.DecodeString(want); err != nil {
 		return fmt.Errorf("update manifest has invalid SHA256 checksum: refusing to install")
 	}
+	resolved, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		return err
+	}
+	exePath, err = filepath.Abs(resolved)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D39): the native installation uses a stable OS-lock sidecar, not Pi's npm managed-release directory lock. Never unlink the sidecar while another process may hold its inode.
+	lock := flock.New(exePath + ".update.lock")
+	locked, err := lock.TryLock()
+	if err != nil {
+		return fmt.Errorf("lock standalone update: %w", err)
+	}
+	if !locked {
+		return fmt.Errorf("another standalone pig update is already running")
+	}
+	defer func() { resultErr = errors.Join(resultErr, lock.Close()) }()
 	dir := filepath.Dir(exePath)
 	tmpPath, sum, err := downloadBinaryToFile(ctx, client, bin.URL, dir, maxUpdateBinaryBytes)
 	if err != nil {

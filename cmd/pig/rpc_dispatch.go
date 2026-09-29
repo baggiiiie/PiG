@@ -5,11 +5,12 @@ import "sync"
 
 // rpcResponseTurn serializes input callbacks and awaited continuations. A completion from any earlier request waits for the currently admitted input batch, not just its original batch. Continuations never wait for future input.
 type rpcResponseTurn struct {
-	mu        sync.Mutex
-	execution sync.Mutex
-	write     func(any)
-	pending   []func()
-	active    bool
+	mu          sync.Mutex
+	execution   sync.Mutex
+	write       func(any)
+	pending     []func()
+	active      bool
+	idleWaiters []chan struct{}
 }
 
 func (t *rpcResponseTurn) begin() {
@@ -36,6 +37,19 @@ func (t *rpcResponseTurn) enqueue(continuations []func()) {
 	t.end()
 }
 
+// idle reports when the admitted input and its queued continuations drain. It does not join suspended commands, which may still be waiting for input.
+func (t *rpcResponseTurn) idle() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	done := make(chan struct{})
+	if t.active {
+		t.idleWaiters = append(t.idleWaiters, done)
+	} else {
+		close(done)
+	}
+	return done
+}
+
 // end drains with execution held. Unlocking execution while mu is still held makes idle publication atomic with producer admission; no completion can be stranded between the empty check and unlock. Continuations can enqueue more work without recursively acquiring execution.
 func (t *rpcResponseTurn) end() {
 	t.mu.Lock()
@@ -44,6 +58,10 @@ func (t *rpcResponseTurn) end() {
 		t.pending = nil
 		if len(pending) == 0 {
 			t.active = false
+			for _, waiter := range t.idleWaiters {
+				close(waiter)
+			}
+			t.idleWaiters = nil
 			t.execution.Unlock()
 			t.mu.Unlock()
 			return

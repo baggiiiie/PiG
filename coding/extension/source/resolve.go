@@ -595,6 +595,15 @@ func nodeEntrypoints(root string) ([]string, error) {
 			// directory without an entry file contributes nothing.
 			return nil, fmt.Errorf("Node extension %s declares pi.extensions directories with no extension entry file", root)
 		}
+		for i, entry := range entries {
+			if info, err := os.Stat(entry); err == nil && info.IsDir() {
+				file, ok := NodeDirectoryImport(entry)
+				if !ok {
+					return nil, fmt.Errorf("Node extension %s: pi.extensions directory %s cannot be imported: it has no index file or package.json main", root, entry)
+				}
+				entries[i] = file
+			}
+		}
 		return entries, nil
 	}
 	for _, name := range []string{"index.ts", "index.js", "main.ts", "main.js", "extension.ts", "extension.js", "index.mjs", "main.mjs", "extension.mjs"} {

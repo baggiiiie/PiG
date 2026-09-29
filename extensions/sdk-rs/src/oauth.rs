@@ -29,6 +29,10 @@ pub struct OAuthCredentials {
     pub expires: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub project_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 /// An authorization URL to present during login.

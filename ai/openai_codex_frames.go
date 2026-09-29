@@ -85,13 +85,15 @@ func codexErrorCodeAndMessage(event map[string]any) (code, message string) {
 	return code, message
 }
 
-func newCodexMappedSSEReader(ctx context.Context, source io.Reader) io.Reader {
+func newCodexMappedSSEReader(ctx context.Context, source io.Reader) (*io.PipeReader, <-chan struct{}) {
 	reader, writer := io.Pipe()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		err := mapCodexSSE(ctx, source, writer)
 		_ = writer.CloseWithError(err)
 	}()
-	return reader
+	return reader, done
 }
 
 func mapCodexSSE(ctx context.Context, source io.Reader, destination io.Writer) error {

@@ -5,23 +5,26 @@ package tools
 import (
 	"os"
 	"os/exec"
-	"strconv"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 // setProcessGroup is a no-op on Windows. Upstream spawns bash with
 // detached:false on win32; the tree is reaped by killProcessGroup via taskkill.
 func setProcessGroup(_ *exec.Cmd) {}
 
-// killProcessGroup kills the process tree with `taskkill /F /T`, the Windows
-// analog of unix's negative-pid SIGKILL. Mirrors upstream killProcessTree
-// (utils/shell.ts). Falls back to a single-process terminate if taskkill fails.
+// windowsTaskkillCommand detaches the hidden cleanup process from the caller's console.
+func windowsTaskkillCommand(pid int) *exec.Cmd {
+	command := newTaskkillCommand(pid)
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS}
+	return command
+}
+
+// killProcessGroup uses the trusted System32 taskkill and consumes failures without switching to a single-process kill.
+// upstream: packages/coding-agent/src/utils/shell.ts:killProcessTree
 func killProcessGroup(p *os.Process) error {
-	kill := exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(p.Pid))
-	kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err := kill.Run(); err != nil {
-		return p.Kill()
-	}
+	runTaskkill(windowsTaskkillCommand(p.Pid), (*exec.Cmd).Run)
 	return nil
 }
 

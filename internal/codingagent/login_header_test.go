@@ -476,14 +476,18 @@ func TestSuccessfulReloadRestoresBuiltInHeaderAndFailedReloadPreservesCurrentLog
 	})
 	m.extHeader = newSpecialLinesComponent(func() {})
 	m.extHeader.SetLines([]string{"old extension login"})
-	m.buildSlashContext(context.Background()).Reload()
+	if err := m.buildSlashContext(t.Context()).Reload(); err != nil {
+		t.Fatal(err)
+	}
 	if got := strings.Join(m.extHeader.Render(65), "\n"); !strings.Contains(got, builtInHeader) || strings.Contains(got, "old extension login") {
 		t.Fatalf("successful reload did not restore stock header before session_start: %q", got)
 	}
 
 	m.extHeader.SetLines([]string{"active login after failed reload"})
 	host.err = errors.New("reload failed")
-	m.buildSlashContext(context.Background()).Reload()
+	if err := m.buildSlashContext(t.Context()).Reload(); err != nil {
+		t.Fatal(err)
+	}
 	if got := m.extHeader.Render(65); len(got) != 1 || got[0] != "active login after failed reload" {
 		t.Fatalf("failed reload replaced active login: %q", got)
 	}

@@ -25,11 +25,6 @@ owner = "div-agent-core"
 summary = "agent.emit drops events once the run context is cancelled: the event send races a Done case, so aborted message_end, turn_end and agent_end are lost."
 
 [[finding]]
-id = "AGENT-05"
-owner = "div-agent-core"
-summary = "Session persistence errors are swallowed: AppendMessage and AppendBashExecution failures only skip bookkeeping, so a full disk loses the transcript silently."
-
-[[finding]]
 id = "AGENT-15"
 owner = "div-agent-core"
 summary = "Session.Close does not abort the active run; the 64-event raw buffer then fills and Send hangs."
@@ -117,20 +112,6 @@ summary = "Extension login preview deadline; add `pig additive (D60)` at the lit
 [[hit]]
 check = "bare-recover"
 file = "coding/session.go"
-func = "Session.emitOrderedEvent"
-snippet = "defer func() { _ = recover() }()"
-finding = "AGENT-16"
-
-[[hit]]
-check = "bare-recover"
-file = "coding/session.go"
-func = "Session.emitOrderedEventSync"
-snippet = "defer func() { _ = recover() }()"
-finding = "AGENT-16"
-
-[[hit]]
-check = "bare-recover"
-file = "coding/session.go"
 func = "emitExtensionError"
 snippet = "if recover() != nil {"
 finding = "AGENT-16"
@@ -199,13 +180,6 @@ snippet = "_ = os.WriteFile(marker, []byte(fp), 0o644)"
 finding = "D20"
 
 [[hit]]
-check = "discarded-io-error"
-file = "coding/session.go"
-func = "Session.appendBashLocked"
-snippet = "if _, err := s.inner.AppendBashExecution("
-finding = "AGENT-05"
-
-[[hit]]
 check = "magic-literal"
 file = "ai/anthropic.go"
 func = "anthropicProvider.buildParams"
@@ -231,13 +205,6 @@ check = "magic-literal"
 file = "ai/http_transport.go"
 func = "baseStreamingHTTPClient"
 snippet = "MaxIdleConnsPerHost: 4,"
-finding = "AI-29"
-
-[[hit]]
-check = "magic-literal"
-file = "ai/models_store.go"
-func = "withSidecarLock"
-snippet = "time.Sleep(20 * time.Millisecond)"
 finding = "AI-29"
 
 [[hit]]

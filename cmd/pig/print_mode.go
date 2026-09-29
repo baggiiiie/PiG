@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,7 +34,7 @@ var errPrintModeHandled = fmt.Errorf("print mode: error already written")
 //
 // Upstream's print mode disposes its runtime and then exits 128+signum
 // (`process.exit(signal === "SIGHUP" ? 129 : 143)`), and leaves SIGINT to
-// Node's default handler, which exits 130. Callers therefore distinguish "a
+// Node's default handler, which terminates by signal. Callers therefore distinguish "a
 // timeout or supervisor killed the run" from "the run failed" by exit code, so
 // pig must report the same codes and must not print an internal cancellation
 // error. Recording the signal and returning normally, rather than exiting from
@@ -67,6 +68,8 @@ type printModeRuntime struct {
 	Session     coding.SessionStartOptions
 	ResumePath  string
 	SessionName string
+	// UnknownFlags carries extension CLI values into the bound runtime.
+	UnknownFlags map[string]any
 	// Commands carries the prompt templates, skills, resource provenance and
 	// built-in llama.cpp command of the session. runPrintMode binds it to
 	// the session's extension runner.
@@ -78,6 +81,8 @@ type printModeRuntime struct {
 	// SystemPromptSections rebuilds the session's system prompt with the
 	// skills extensions discovered (upstream _rebuildSystemPrompt).
 	SystemPromptSections func(skills []*codingagent.SkillDef) ai.OrderedSections
+	// SystemPromptResources reports the resource-loader state behind the rebuilt prompt.
+	SystemPromptResources func(skills []*codingagent.SkillDef) *coding.SystemPromptResources
 }
 
 // printModeOptions mirrors upstream PrintModeOptions (print-mode.ts).
@@ -123,15 +128,12 @@ func runPrintMode(ctx context.Context, host printModeRuntime, opts printModeOpti
 	if opts.convertEvent == nil {
 		opts.convertEvent = rpcAgentEvent
 	}
-	// Print mode owns SIGINT: there's no interactive editor to deliver
-	// Ctrl+C as a byte, so the signal is the only abort path. SIGTERM and
-	// SIGHUP are owned here too so the exit code reports the signal:
-	// upstream registers SIGTERM (plus SIGHUP off win32) and exits
-	// 128+signum after disposing its runtime.
+	// Pi owns SIGTERM and SIGHUP but leaves SIGINT to the process default action.
+	// A signal-terminated process is distinguishable from numeric exit 130.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	intCh := make(chan os.Signal, 1)
-	termSignals := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	termSignals := []os.Signal{syscall.SIGTERM}
 	if runtime.GOOS != "windows" {
 		termSignals = append(termSignals, syscall.SIGHUP)
 	}
@@ -181,6 +183,8 @@ func runPrintMode(ctx context.Context, host printModeRuntime, opts printModeOpti
 	defer func() { _ = sess.Close() }()
 	detachModelRegistry := wireSubprocessModelRegistry(host.Bridge, sess, host.Services)
 	defer detachModelRegistry()
+	bindSessionReadActions(host.Bridge, func() *coding.Session { return sess }, host.Services.CWD(), host.Session.SessionDir)
+	bindSessionAppendEntry(host.Bridge, func() *coding.Session { return sess })
 	// Upstream print mode binds the session to its extensions
 	// (session.bindExtensions), so sendUserMessage, isIdle, abort,
 	// hasPendingMessages, and waitForIdle reach this session.
@@ -189,10 +193,13 @@ func runPrintMode(ctx context.Context, host printModeRuntime, opts printModeOpti
 		extensionMode = extension.ModeJSON
 	}
 	runner := rt.NewExtensionRunner()
+	if runner != nil {
+		runner.SetUIContext(nil, extensionMode)
+	}
 	bindSessionExtensionActions(runner, host.Bridge, func() *coding.Session { return sess }, extension.ContextActions{
 		ModelRegistry:    host.Services.Registry(),
 		IsProjectTrusted: host.Services.SettingsManager().IsProjectTrusted,
-		Mode:             extensionMode,
+		GetFlagValue:     func(name string) any { return host.UnknownFlags[name] },
 	})
 	commands := host.Commands
 	commands.runner = runner
@@ -214,11 +221,9 @@ func runPrintMode(ctx context.Context, host printModeRuntime, opts printModeOpti
 		})
 	}
 
-	// Persist --name to session_info so the display name survives resume.
-	// Mirrors upstream sessionManager.appendSessionInfo(name) (main.ts:580),
-	// which runs when the session is created, before any mode starts.
+	// Initial naming appends metadata without a runtime name-change notification.
 	if host.SessionName != "" {
-		if err := sess.SetSessionName(host.SessionName); err != nil {
+		if _, err := sess.Inner().AppendSessionInfo(host.SessionName); err != nil {
 			return fmt.Errorf("set session name: %w", err)
 		}
 	}
@@ -293,8 +298,16 @@ func runPrintMode(ctx context.Context, host printModeRuntime, opts printModeOpti
 	// session_start (and clean up on session_shutdown) run in print mode too,
 	// not only interactive.
 	sess.EmitSessionStart("startup")
-	if commands.extendFromExtensions(ctx, runner, "startup") && host.SystemPromptSections != nil {
+	skillsChanged, resourceErr := commands.extendFromExtensions(ctx, runner, "startup")
+	if resourceErr != nil {
+		runErr = resourceErr
+		return nil // reported by the teardown above
+	}
+	if skillsChanged && host.SystemPromptSections != nil {
 		sess.SetSystemPromptSections(host.SystemPromptSections(commands.skills))
+		if host.SystemPromptResources != nil {
+			sess.SetSystemPromptResources(*host.SystemPromptResources(commands.skills))
+		}
 	}
 	publishedCommands.Store(new(commands))
 
@@ -341,6 +354,10 @@ func sendPrintPrompt(ctx context.Context, sess *coding.Session, commands headles
 	text, images, handled, err = sess.RunInputHandlers(ctx, text, images, extension.InputSourceUser, "")
 	if err != nil || handled {
 		return handled, err
+	}
+	// An absent startup selection becomes Pi's Agent DEFAULT_MODEL. Its unknown provider fails credential preflight, not the lower-level SendContent model guard; commands and handled input above do not need credentials.
+	if model := sess.Model(); model == nil || model.Provider == nil && model.ProviderMeta.ProviderID == "unknown" {
+		return false, errors.New(codingagent.FormatNoAPIKeyFoundMessage("unknown"))
 	}
 	_, err = sess.SendContent(ctx, coding.BuildUserContent(commands.expandPrompt(text), images))
 	return false, err

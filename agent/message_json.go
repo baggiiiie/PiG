@@ -1,12 +1,13 @@
+// Ports packages/agent/src/types.ts.
 package agent
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	json "github.com/MichaelKinsy/PiG/extensions/sdk/json"
 )
 
 // Clone copies the message envelope and mutable top-level slices/maps.
@@ -17,7 +18,9 @@ func (m AgentMessage) Clone() AgentMessage {
 		clone.System = ai.GetInitialSystemMessage([]ai.Message{*m.System})
 	case m.User != nil:
 		value := *m.User
-		value.Content = slices.Clone(m.User.Content)
+		if blocks, ok := m.User.Content.(ai.UserContentBlocks); ok {
+			value.Content = slices.Clone(blocks)
+		}
 		clone.User = &value
 	case m.Assistant != nil:
 		value := *m.Assistant
@@ -49,7 +52,7 @@ func (m AgentMessage) Clone() AgentMessage {
 	return clone
 }
 
-// MarshalJSON emits the upstream flat role-discriminated AgentMessage union.
+// MarshalJSON emits the upstream flat role-discriminated AgentMessage union. User strings and text blocks retain their JavaScript UTF-16 units.
 func (m AgentMessage) MarshalJSON() ([]byte, error) {
 	variants := 0
 	if m.System != nil {
@@ -75,13 +78,22 @@ func (m AgentMessage) MarshalJSON() ([]byte, error) {
 	case m.System != nil:
 		return json.Marshal(m.System)
 	case m.User != nil:
-		content, err := marshalAgentContent(m.User.Content)
-		if err != nil {
-			return nil, err
+		var content any
+		switch value := m.User.Content.(type) {
+		case ai.UserText:
+			content = value
+		case ai.UserContentBlocks:
+			encoded, err := marshalAgentContent(value)
+			if err != nil {
+				return nil, err
+			}
+			content = encoded
+		case nil:
+			content = []any{}
 		}
 		return json.Marshal(struct {
 			Role      string `json:"role"`
-			Content   []any  `json:"content"`
+			Content   any    `json:"content"`
 			Timestamp int64  `json:"timestamp"`
 		}{Role: RoleUser, Content: content, Timestamp: m.User.Timestamp})
 	case m.Assistant != nil:
@@ -146,7 +158,7 @@ func (m AgentMessage) MarshalJSON() ([]byte, error) {
 	}
 }
 
-// UnmarshalJSON decodes the upstream flat role-discriminated AgentMessage union.
+// UnmarshalJSON decodes the upstream flat role-discriminated AgentMessage union and retains lone UTF-16 units in user content as WTF-8.
 func (m *AgentMessage) UnmarshalJSON(data []byte) error {
 	var wire agentMessageWire
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -313,12 +325,19 @@ func marshalAgentContentBlock(block ai.ContentBlock) (any, error) {
 	}
 }
 
-func unmarshalUserContent(data []byte) ([]ai.UserContentBlock, error) {
+func unmarshalUserContent(data []byte) (ai.UserContent, error) {
+	if len(data) > 0 && data[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return nil, err
+		}
+		return ai.UserText(text), nil
+	}
 	blocks, err := unmarshalAgentContent(data)
 	if err != nil {
 		return nil, err
 	}
-	content := make([]ai.UserContentBlock, len(blocks))
+	content := make(ai.UserContentBlocks, len(blocks))
 	for i, block := range blocks {
 		value, ok := block.(ai.UserContentBlock)
 		if !ok {

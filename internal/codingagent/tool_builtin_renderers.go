@@ -203,7 +203,7 @@ func shellRenderResult(result extension.AgentToolResult, options extension.ToolR
 		footer = themeFg(tui.ActiveTheme().Muted, label+" "+tui.FormatToolDuration(end.Sub(startedAt)))
 	}
 	return linesComponent{render: func(width int) []string {
-		lines := shellResultLines(value.Content, details, options.IsPartial, options.Expanded, width)
+		lines := shellResultLines(value.Text(), details, options.IsPartial, options.Expanded, width)
 		if footer != "" {
 			lines = append(lines, tui.NewPaddedText("\n"+footer, 0, 0, nil).Render(width)...)
 		}
@@ -246,7 +246,7 @@ func readRenderResult(result extension.AgentToolResult, options extension.ToolRe
 	theme := tui.ActiveTheme()
 	value := renderResultValue(result)
 	rawPath, _ := stringArg(context.Args, "file_path", "path")
-	output := shellTextOutput(value.Content)
+	output := shellTextOutput(value.Text())
 	lang := ""
 	if !context.IsError && rawPath != "" {
 		lang = tui.LanguageFromPath(rawPath)
@@ -326,7 +326,7 @@ func readTruncation(details any) *tools.TruncationResult {
 func listRenderResult(name string) extension.ToolRenderResultFunc {
 	return func(result extension.AgentToolResult, options extension.ToolRenderResultOptions, _ extension.Theme, _ extension.ToolRenderContext) extension.Component {
 		value := renderResultValue(result)
-		body := makeListBodyRenderer(name, value.Content, value.Details)
+		body := makeListBodyRenderer(name, value.Text(), value.Details)
 		return linesComponent{render: func(width int) []string {
 			lines := body(width, options.Expanded)
 			if len(lines) == 0 {
@@ -384,7 +384,7 @@ func writeRenderCall(args json.RawMessage, _ extension.Theme, context extension.
 // writeRenderResult is upstream write.ts renderResult: the error text of a
 // failed write, else nothing.
 func writeRenderResult(result extension.AgentToolResult, _ extension.ToolRenderResultOptions, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
-	output := renderResultValue(result).Content
+	output := renderResultValue(result).Text()
 	if !context.IsError || output == "" {
 		return tui.NewPaddedText("", 0, 0, nil)
 	}
@@ -579,10 +579,10 @@ func editRenderResult(result extension.AgentToolResult, _ extension.ToolRenderRe
 	}
 	empty := linesComponent{render: func(int) []string { return nil }}
 	if context.IsError {
-		if value.Content == "" || value.Content == previewError {
+		if value.Text() == "" || value.Text() == previewError {
 			return empty
 		}
-		output := themeFg(tui.ActiveTheme().Error, value.Content)
+		output := themeFg(tui.ActiveTheme().Error, value.Text())
 		return linesComponent{render: func(width int) []string {
 			return append([]string{""}, tui.NewPaddedText(output, 1, 0, nil).Render(width)...)
 		}}

@@ -1,6 +1,7 @@
 package codingagent
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"math"
@@ -53,7 +54,8 @@ type StatusLine struct {
 
 	// Cwd and gitBranch for line 1.
 	cwd       string
-	gitBranch string // cached; resolved once at init via resolveGitBranch
+	gitBranch string    // cached; resolved from the initial repository binding
+	gitPaths  *gitPaths // repository binding captured before extension startup
 
 	// Session name shown in footer as " • <name>".
 	name string
@@ -113,12 +115,16 @@ func NewStatusLine(model *ai.Model, agentName string, timings *agent.Recorder) *
 	return s
 }
 
-// SetCwd sets the working directory shown in the footer and resolves
-// the git branch. Call once at init.
+// SetCwd binds the footer and its branch watcher to the repository present at initialization.
 func (s *StatusLine) SetCwd(cwd string) {
 	s.mu.Lock()
 	s.cwd = cwd
-	s.gitBranch = resolveGitBranch(cwd)
+	s.gitPaths = nil
+	s.gitBranch = ""
+	if paths, ok := findGitPaths(cwd); cwd != "" && ok {
+		s.gitPaths = &paths
+		s.gitBranch = resolveGitBranchFromPaths(paths)
+	}
 	s.mu.Unlock()
 	s.Invalidate()
 }
@@ -771,18 +777,8 @@ func ansi(code int, body string) string {
 // stripANSI removes ANSI escape sequences (delegates to widthx.StripAnsi).
 func stripANSI(s string) string { return widthx.StripAnsi(s) }
 
-// resolveGitBranch returns the current git branch name, "detached" for a
-// detached HEAD, or "" outside a repository. Mirrors upstream
-// footer-data-provider.ts resolveGitBranchSync: it reads HEAD directly and runs
-// git only for a reftable HEAD, whose placeholder ref names no branch.
-func resolveGitBranch(cwd string) string {
-	if cwd == "" {
-		return ""
-	}
-	paths, ok := findGitPaths(cwd)
-	if !ok {
-		return ""
-	}
+// resolveGitBranchFromPaths reads the bound HEAD, asking Git only for a reftable placeholder, as FooterDataProvider.resolveGitBranchSync does.
+func resolveGitBranchFromPaths(paths gitPaths) string {
 	content, err := os.ReadFile(paths.headPath)
 	if err != nil {
 		return ""
@@ -792,7 +788,7 @@ func resolveGitBranch(cwd string) string {
 		return "detached"
 	}
 	if branch == ".invalid" {
-		if resolved := resolveBranchWithGit(paths.repoDir); resolved != "" {
+		if resolved := resolveBranchWithGit(context.Background(), paths.repoDir); resolved != "" {
 			return resolved
 		}
 		return "detached"
@@ -803,14 +799,20 @@ func resolveGitBranch(cwd string) string {
 // resolveBranchWithGit asks git for the current branch. It returns "" on a
 // detached HEAD or when git is unavailable. Mirrors upstream
 // resolveBranchWithGitSync; tests replace it to observe process spawns.
-var resolveBranchWithGit = func(repoDir string) string {
-	cmd := exec.Command("git", "--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD")
+var resolveBranchWithGit = func(ctx context.Context, repoDir string) string {
+	cmd := gitBranchCommand(ctx, repoDir)
 	cmd.Dir = repoDir
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func gitBranchCommand(ctx context.Context, repoDir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD")
+	cmd.Dir = repoDir
+	return cmd
 }
 
 // SetContextUsage stores the Session projection estimate outside the render path.

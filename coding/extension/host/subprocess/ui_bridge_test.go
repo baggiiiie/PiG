@@ -124,10 +124,12 @@ func (m *mockUIContext) GetTheme(name string) (extension.Theme, error) {
 	}
 	return m.namedTheme, nil
 }
-func (m *mockUIContext) SetWidget(string, any, extension.ExtensionWidgetOptions)       {}
-func (m *mockUIContext) OnTerminalInput(extension.TerminalInputHandler) func()         { return func() {} }
-func (m *mockUIContext) Custom(context.Context, any, any) (any, error)                 { return nil, nil }
-func (m *mockUIContext) AddAutocompleteProvider(extension.AutocompleteProviderFactory) {}
+func (m *mockUIContext) SetWidget(string, any, extension.ExtensionWidgetOptions) {}
+func (m *mockUIContext) OnTerminalInput(extension.TerminalInputHandler) func()   { return func() {} }
+func (m *mockUIContext) Custom(context.Context, any, any) (any, error)           { return nil, nil }
+func (m *mockUIContext) AddAutocompleteProvider(extension.AutocompleteProviderFactory) error {
+	return nil
+}
 
 func newTestBridge(ui extension.UIContext) *UIBridge {
 	b := NewUIBridge(func() {})
@@ -199,7 +201,7 @@ func TestUIBridge_HandleCall_SetStatus(t *testing.T) {
 // it only re-renders when the host pushes a fresh state_update. Before the
 // fix, ui.setStatus never notified the host to push one, so a footer
 // composed from getExtensionStatuses() (as in
-// parity/scenarios/extensions-runtime/testdata/ext/footer-status.mjs) could
+// test/parity/scenarios/extensions-runtime/testdata/ext/footer-status.mjs) could
 // go stale forever after the initial render, most visibly across /reload
 // (scenario 15-footer-status-reload-composition) where no other state
 // transition happens to trigger an incidental re-render.
@@ -404,6 +406,7 @@ func TestUIBridge_HandleCall_PasteToEditor(t *testing.T) {
 func TestUIBridge_HandleWidgetPush_ViaCall(t *testing.T) {
 	invalidated := false
 	b := NewUIBridge(func() { invalidated = true })
+	b.SetUIContext(&mockUIContext{})
 
 	b.HandleWidgetPush("ext1", &WidgetPushPayload{Key: "w1", Lines: []string{"line1", "line2"}})
 
@@ -420,12 +423,11 @@ func TestUIBridge_HandleWidgetPush_ViaCall(t *testing.T) {
 	}
 }
 
-// A widget pushed before the interactive TUI wires its render callback (an
-// extension that sets a widget while loading) must request renders through the
-// live callback on later pushes. Otherwise a widget an extension updates from a
-// timer stays frozen until something else repaints.
+// A widget pushed before replacing the interactive render callback uses the
+// live callback on later pushes, rather than retaining the previous callback.
 func TestUIBridge_WidgetPushedBeforeSetInvalidateUsesLiveCallback(t *testing.T) {
 	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
 	b.HandleWidgetPush("ext1", &WidgetPushPayload{Key: "clock", Lines: []string{"12:00"}})
 
 	var renders atomic.Int32
@@ -442,6 +444,7 @@ func TestUIBridge_WidgetPushedBeforeSetInvalidateUsesLiveCallback(t *testing.T) 
 
 func TestUIBridge_ClearExtension_AllKeys(t *testing.T) {
 	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
 	b.HandleWidgetPush("ext1", &WidgetPushPayload{Key: "a", Lines: []string{"x"}})
 	b.HandleWidgetPush("ext1", &WidgetPushPayload{Key: "b", Lines: []string{"y"}})
 	b.HandleWidgetPush("ext2", &WidgetPushPayload{Key: "c", Lines: []string{"z"}})
@@ -562,6 +565,8 @@ func TestUIBridge_HandleCall_SetWidget_RequestObserverPreservesPlacement(t *test
 	var key string
 	var lines []string
 	var placement string
+	var cachedUpdates int
+	b.SetWidgetSyncFunc(func(map[string]*PushProxy) { cachedUpdates++ })
 	b.SetWidgetRequestFunc(func(_ string, gotKey string, gotLines []string, opts extension.ExtensionWidgetOptions) {
 		key = gotKey
 		lines = gotLines
@@ -577,6 +582,9 @@ func TestUIBridge_HandleCall_SetWidget_RequestObserverPreservesPlacement(t *test
 	}
 	if key != "w" || !slices.Equal(lines, []string{"a", "b"}) || placement != "belowEditor" {
 		t.Fatalf("widget request = key:%q lines:%v placement:%q", key, lines, placement)
+	}
+	if cachedUpdates != 0 || b.GetWidget("test-ext", "w") != nil {
+		t.Fatal("serialized RPC widget request must not also publish a cached TUI widget")
 	}
 }
 
@@ -649,7 +657,7 @@ func TestUIBridge_HandleCall_AppendEntry(t *testing.T) {
 	var gotType string
 	var gotData any
 	b.SetActions(&HostCallbacks{
-		AppendEntry: func(customType string, data any) error {
+		AppendEntry: func(customType string, data any, _ *DirectEntryAppend) error {
 			gotType = customType
 			gotData = data
 			return nil
@@ -735,7 +743,7 @@ func TestFocusedInputDeliveryFailureClosesOverlay(t *testing.T) {
 	target := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
 	proxy.SetTarget(target)
 
-	bridge.sendCustomInput("ext", nil, "focused", "x")
+	bridge.sendCustomInput(t.Context(), "ext", nil, "focused", "x")
 	select {
 	case <-target.closed:
 	case <-time.After(time.Second):
@@ -1195,6 +1203,7 @@ func (h *recordingRemoteOverlayHandle) Close(result any) {
 
 func TestUIBridgeClearExtensionRemovesWidgetsFromMountedSet(t *testing.T) {
 	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(&mockUIContext{})
 	counts := make(chan int, 2)
 	bridge.SetWidgetSyncFunc(func(widgets map[string]*PushProxy) { counts <- len(widgets) })
 	bridge.HandleWidgetPush("ext", &WidgetPushPayload{Key: "status", Lines: []string{"ready"}})
@@ -1224,8 +1233,9 @@ func TestUIBridge_HandleCall_SetFooter_Clear(t *testing.T) {
 	}
 }
 
-func TestUIBridgeReplaysPreTUIStatusAndFooter(t *testing.T) {
+func TestUIBridgeReplaysBoundStatusAndFooterOnRebind(t *testing.T) {
 	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(&mockUIContext{})
 	if _, err := call(bridge, "ui.setStatus", `{"key":"startup","text":"ready"}`); err != nil {
 		t.Fatal(err)
 	}
@@ -1245,6 +1255,7 @@ func TestUIBridgeReplaysPreTUIStatusAndFooter(t *testing.T) {
 
 func TestUIBridge_AllWidgets(t *testing.T) {
 	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
 	b.HandleWidgetPush("e1", &WidgetPushPayload{Key: "a", Lines: []string{"1"}})
 	b.HandleWidgetPush("e2", &WidgetPushPayload{Key: "b", Lines: []string{"2"}})
 

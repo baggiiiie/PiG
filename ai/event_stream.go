@@ -1,5 +1,7 @@
 package ai
 
+// Ports packages/ai/src/utils/event-stream.ts
+
 import (
 	"context"
 	"errors"
@@ -28,6 +30,7 @@ type AssistantMessageEventStream struct {
 
 	started  bool
 	terminal bool
+	resolved bool
 	result   *AssistantMessage
 }
 
@@ -37,11 +40,12 @@ func NewAssistantMessageEventStream() *AssistantMessageEventStream {
 }
 
 // Push appends an event. Pushes after termination are ignored, matching Pi's
-// EventStream. Invalid pre-terminal event sequences return an invariant error.
+// EventStream. Done and error may terminate without a start event. Other invalid pre-terminal event sequences return an invariant error.
 func (s *AssistantMessageEventStream) Push(event AssistantMessageEvent) error {
 	if event == nil {
 		return errors.New("assistant message stream event is nil")
 	}
+	// pig divergence (D82): emission-time partial snapshots reach RPC listeners; same-process observation parity remains a separate obligation.
 	event = snapshotAssistantEvent(event)
 
 	s.mu.Lock()
@@ -75,6 +79,7 @@ func (s *AssistantMessageEventStream) Push(event AssistantMessageEvent) error {
 	}
 
 	if terminal {
+		s.resolved = true
 		close(s.done)
 		for _, waiter := range s.waiters {
 			waiter.ready <- eventDelivery{done: true}
@@ -95,9 +100,6 @@ func (s *AssistantMessageEventStream) validateLocked(event AssistantMessageEvent
 		}
 		s.started = true
 	case DoneEvent:
-		if !s.started {
-			return errors.New("assistant message stream emitted done before start")
-		}
 		if value.Message == nil {
 			return errors.New("assistant message stream done is missing message")
 		}
@@ -188,13 +190,38 @@ func (s *AssistantMessageEventStream) cancelWaiter(waiter *eventWaiter) (eventDe
 	return <-waiter.ready, true
 }
 
-// Result waits for termination and returns the exact pointer carried by the
-// terminal DoneEvent or ErrorEvent.
-func (s *AssistantMessageEventStream) Result() *AssistantMessage {
-	<-s.done
+// End closes iteration without synthesizing an event. An optional result resolves Result once; ending without a result leaves it pending, as Pi's EventStream.end does.
+func (s *AssistantMessageEventStream) End(result ...*AssistantMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.result
+	s.terminal = true
+	if len(result) > 0 && !s.resolved {
+		s.result = result[0]
+		s.resolved = true
+		close(s.done)
+	}
+	for _, waiter := range s.waiters {
+		waiter.ready <- eventDelivery{done: true}
+	}
+	s.waiters = nil
+}
+
+// Result waits for a terminal event or End result and returns the first resolved message pointer.
+func (s *AssistantMessageEventStream) Result() *AssistantMessage {
+	result, _ := s.ResultContext(context.Background())
+	return result
+}
+
+// ResultContext waits for the final result or the caller's cancellation without changing stream ownership.
+func (s *AssistantMessageEventStream) ResultContext(ctx context.Context) (*AssistantMessage, error) {
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result, nil
 }
 
 func eventPartial(event AssistantMessageEvent) *AssistantMessage {

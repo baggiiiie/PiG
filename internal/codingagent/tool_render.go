@@ -68,11 +68,11 @@ func toolBodyRenderer(toolName string, result agent.AgentToolResult, took *time.
 	case "bash", "powershell":
 		// Both shell tools share upstream createShellRenderers
 		// (renderers/index.ts createAllToolRenderers).
-		return makeShellBodyRenderer(result.Content, result.Details, false, took)
+		return makeShellBodyRenderer(result.Text(), result.Details, false, took)
 	case "edit":
 		if result.IsError {
 			return func(width int, _ bool) []string {
-				return styleWrapRows(result.Content, tui.ActiveTheme().Error, tui.SGRFgReset, width)
+				return styleWrapRows(result.Text(), tui.ActiveTheme().Error, tui.SGRFgReset, width)
 			}
 		}
 		// Built-in edit tool: render the precomputed display diff (upstream
@@ -89,7 +89,7 @@ func toolBodyRenderer(toolName string, result agent.AgentToolResult, took *time.
 		}
 		return nil
 	case "grep", "find", "ls":
-		return makeListBodyRenderer(toolName, result.Content, result.Details)
+		return makeListBodyRenderer(toolName, result.Text(), result.Details)
 	case "write":
 		d, ok := result.Details.(*tools.WriteDetails)
 		if !ok || d == nil {
@@ -97,11 +97,11 @@ func toolBodyRenderer(toolName string, result agent.AgentToolResult, took *time.
 		}
 		return func(width int, expanded bool) []string {
 			out := renderWriteContent(d, width, expanded)
-			if result.IsError && result.Content != "" {
+			if result.IsError && result.Text() != "" {
 				if len(out) > 0 {
 					out = append(out, "")
 				}
-				out = append(out, styleWrapRows(result.Content, tui.ActiveTheme().Error, tui.SGRFgReset, width)...)
+				out = append(out, styleWrapRows(result.Text(), tui.ActiveTheme().Error, tui.SGRFgReset, width)...)
 			}
 			return out
 		}
@@ -112,9 +112,9 @@ func toolBodyRenderer(toolName string, result agent.AgentToolResult, took *time.
 		}
 		return func(width int, expanded bool) []string {
 			if result.IsError {
-				return renderReadError(result.Content, width, expanded)
+				return renderReadError(result.Text(), width, expanded)
 			}
-			return renderReadLines(d, result.Content, width, expanded)
+			return renderReadLines(d, result.Text(), width, expanded)
 		}
 	}
 
@@ -124,7 +124,7 @@ func toolBodyRenderer(toolName string, result agent.AgentToolResult, took *time.
 	// This gives subprocess extensions control over collapsed rendering
 	// without implementing a full in-process BodyRenderer.
 	if result.Preview != "" {
-		return makePreviewBodyRenderer(result.Content, result.Preview, elapsed)
+		return makePreviewBodyRenderer(result.Text(), result.Preview, elapsed)
 	}
 
 	return nil

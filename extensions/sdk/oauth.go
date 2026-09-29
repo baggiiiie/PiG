@@ -36,6 +36,8 @@ type OAuthCredentials struct {
 	Access    string `json:"access"`
 	Expires   int64  `json:"expires"`
 	ProjectID string `json:"projectId,omitempty"`
+	AccountID string `json:"accountId,omitempty"`
+	Scope     string `json:"scope,omitempty"`
 }
 
 // OAuthAuthInfo, OAuthDeviceCodeInfo, OAuthPrompt, OAuthSelectPrompt, and

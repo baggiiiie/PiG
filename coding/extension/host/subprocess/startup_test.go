@@ -159,9 +159,9 @@ func TestHostFinalExtensionSetOwnsUnselectedPreloadUntilShutdown(t *testing.T) {
 // dispatches tool_call in that same order. A blocking first handler must
 // therefore prevent every later handler at startup and after repeated reloads.
 func TestHostLoadAndReloadPreserveConfiguredGuardOrder(t *testing.T) {
+	// The Host has an explicit private config root; these factories read only their own marker files.
+	t.Parallel()
 	root := t.TempDir()
-	t.Setenv("HOME", filepath.Join(root, "home"))
-	t.Setenv("PIG_HOME", filepath.Join(root, "pig-home"))
 	marker := filepath.Join(root, "guard-order")
 	commandMarker := filepath.Join(root, "command-order")
 
@@ -252,9 +252,8 @@ export default function(pi) {
 // Upstream resource-loader.ts clears the module cache before every reload.
 // The fresh factory has fresh module state even when the source did not change.
 func TestHostReloadRestartsUnchangedNodeExtension(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
-	t.Setenv("HOME", filepath.Join(root, "home"))
-	t.Setenv("PIG_HOME", filepath.Join(root, "pig-home"))
 	marker := filepath.Join(root, "counter")
 	config := startupNodeFixture(t, root, "counter", fmt.Sprintf(`
 import { appendFileSync } from "node:fs";

@@ -69,6 +69,8 @@ type rpcAdmission struct {
 	write         func(any)
 	tasks         rpcTaskGroup
 	runs          *sync.WaitGroup
+	// commandDone runs after the extension command's synchronous prefix, before its prompt continuation reports success.
+	commandDone func()
 }
 
 func rpcAwaitWork[T any](a *rpcAdmission, slow bool, work func() (T, error)) *rpcPromise[T] {
@@ -118,7 +120,7 @@ func (a *rpcAdmission) input(text string, images []ai.ImageContent, behavior str
 	emitted.then(wrapped.resolve)
 	return wrapped
 }
-func (a *rpcAdmission) queue(id, command, text string, images []ai.ImageContent) {
+func (a *rpcAdmission) queue(id rpcRequestID, command, text string, images []ai.ImageContent) {
 	queued := &rpcPromise[struct{}]{turn: a.turn}
 	if name, _, ok := a.catalog.extensionCommand(text); ok {
 		queued.resolve(struct{}{}, fmt.Errorf("Extension command %q cannot be queued. Use prompt() or execute the command when not streaming.", "/"+strings.TrimPrefix(name, "/")))
@@ -136,9 +138,9 @@ func (a *rpcAdmission) queue(id, command, text string, images []ai.ImageContent)
 				return
 			}
 			if command == "steer" {
-				a.session.Steer(a.catalog.expandPrompt(input.text), input.images)
+				a.session.QueueSteer(a.catalog.expandPrompt(input.text), input.images)
 			} else {
-				a.session.FollowUp(a.catalog.expandPrompt(input.text), input.images)
+				a.session.QueueFollowUp(a.catalog.expandPrompt(input.text), input.images)
 			}
 			err = a.session.FlushEvents(a.ctx)
 			// _queueUserInput awaits the resolved _queueSteer/_queueFollowUp call.
@@ -156,16 +158,20 @@ func (a *rpcAdmission) queue(id, command, text string, images []ai.ImageContent)
 		}
 	})
 }
-func (a *rpcAdmission) command(id, name, args string) {
-	rpcAwaitHandler(a, func(ctx context.Context) (struct{}, error) {
+func (a *rpcAdmission) command(id rpcRequestID, name, args string) {
+	pending := rpcAwaitHandler(a, func(ctx context.Context) (struct{}, error) {
 		a.catalog.executeCommand(ctx, name, args)
 		return struct{}{}, nil
-	}).then(func(_ struct{}, _ error) {
+	})
+	if a.commandDone != nil {
+		a.commandDone()
+	}
+	pending.then(func(_ struct{}, _ error) {
 		a.turn.after(func() { a.write(rpcSuccess(id, "prompt", nil)) })
 	})
 }
 
-func (a *rpcAdmission) prompt(id string, cmd RPCPromptCommand) {
+func (a *rpcAdmission) prompt(id rpcRequestID, cmd RPCPromptCommand) {
 	if strings.HasPrefix(cmd.Message, "/") {
 		// An unresolved slash command still awaits _tryExecuteExtensionCommand(false).
 		a.turn.after(func() { a.promptInput(id, cmd) })
@@ -174,7 +180,7 @@ func (a *rpcAdmission) prompt(id string, cmd RPCPromptCommand) {
 	a.promptInput(id, cmd)
 }
 
-func (a *rpcAdmission) promptInput(id string, cmd RPCPromptCommand) {
+func (a *rpcAdmission) promptInput(id rpcRequestID, cmd RPCPromptCommand) {
 	fail := func(err error) { a.turn.after(func() { a.write(rpcError(id, "prompt", err.Error())) }) }
 	if a.session.IsCompacting() {
 		fail(fmt.Errorf("Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."))
@@ -199,9 +205,9 @@ func (a *rpcAdmission) promptInput(id string, cmd RPCPromptCommand) {
 				return
 			}
 			if cmd.StreamingBehavior == "followUp" {
-				a.session.FollowUp(text, input.images)
+				a.session.QueueFollowUp(text, input.images)
 			} else {
-				a.session.Steer(text, input.images)
+				a.session.QueueSteer(text, input.images)
 			}
 			if err := a.session.FlushEvents(a.ctx); err != nil {
 				fail(err)
@@ -230,7 +236,7 @@ func (a *rpcAdmission) promptInput(id string, cmd RPCPromptCommand) {
 		}
 	})
 }
-func (a *rpcAdmission) beforeAgentStart(id string, content []ai.UserContentBlock, hasImages bool, fail func(error)) {
+func (a *rpcAdmission) beforeAgentStart(id rpcRequestID, content []ai.UserContentBlock, hasImages bool, fail func(error)) {
 	hasHandlers := a.runner != nil && a.runner.HasHandlers("before_agent_start")
 	var preparation *rpcPromise[*coding.PreparedPrompt]
 	if hasHandlers {

@@ -178,7 +178,7 @@ func cloneRadiusGatewayModel(model RadiusGatewayModel) RadiusGatewayModel {
 }
 
 func truncateHTTPBody(body string) string {
-	trimmed := strings.TrimSpace(body)
+	trimmed := trimJSWhitespace(body)
 	if utf16Length(trimmed) <= 512 {
 		return trimmed
 	}

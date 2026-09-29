@@ -170,7 +170,7 @@ func (p xaiOAuthProvider) pollToken(ctx context.Context, deviceCode string) (Dev
 	case "authorization_pending":
 		return DeviceCodePollResult[OAuthCredentials]{Status: DevicePollPending}, nil
 	case "slow_down":
-		return DeviceCodePollResult[OAuthCredentials]{Status: DevicePollSlowDown}, nil
+		return DeviceCodePollResult[OAuthCredentials]{Status: DevicePollSlowDown, IntervalSeconds: body.Interval}, nil
 	case "access_denied", "authorization_denied":
 		return DeviceCodePollResult[OAuthCredentials]{Status: DevicePollFailed, Message: "xAI device authorization was denied"}, nil
 	case "expired_token":

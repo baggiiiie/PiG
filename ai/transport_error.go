@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 )
 
@@ -30,11 +31,19 @@ func contextTransportError(ctx context.Context) error {
 
 // nodeFetchTransport maps failures before response headers to the "fetch failed" rejection used by Node/undici. HTTP responses, including error statuses, remain responses. Body read failures are mapped separately because undici reports a dropped response stream as "terminated".
 type nodeFetchTransport struct {
-	base http.RoundTripper
+	base           http.RoundTripper
+	connectionIdle bool
 }
 
 func (transport *nodeFetchTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	response, err := transport.base.RoundTrip(request)
+	prepared := request
+	if transport.connectionIdle {
+		// Only the owned transport needs idle activation. Caller-provided fetch clients retain the original request context identity.
+		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { activateHTTPIdleTimeout(info.Conn) }}
+		prepared = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+		prepared = originFormRequest(prepared)
+	}
+	response, err := transport.base.RoundTrip(prepared)
 	if err != nil {
 		if contextErr := contextTransportError(request.Context()); contextErr != nil {
 			return response, contextErr

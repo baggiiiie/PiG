@@ -18,7 +18,7 @@ COUNT_FLAG=()
 HEAVY_PKGS=(
   ./cmd/pig
   ./coding/extension/host/subprocess
-  ./tests/extension-conformance
+  ./test/extension-conformance
 )
 SERIAL_PKGS=(
 )
@@ -86,7 +86,7 @@ case "$MODE" in
     case "$MODE" in
       cli) selected=./cmd/pig ;;
       subprocess) selected=./coding/extension/host/subprocess ;;
-      conformance) selected=./tests/extension-conformance ;;
+      conformance) selected=./test/extension-conformance ;;
     esac
     selected=$(go list "$selected")
     run_group "$MODE" "$SUBPROCESS_PARALLEL" "$selected"

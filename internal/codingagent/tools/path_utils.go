@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 )
 
 // unicodeSpacesRE matches non-standard spaces that LLMs sometimes emit
@@ -65,22 +67,12 @@ func expandPath(filePath string) string {
 	return normalized
 }
 
-// windowsShellDrivePath matches /c, /c/rest, /mnt/c/rest and /cygdrive/c/rest.
-var windowsShellDrivePath = regexp.MustCompile(`(?i)^/(?:mnt/|cygdrive/)?([a-z])(?:/(.*))?$`)
-
 // NormalizeWindowsShellPath converts a Git Bash, MSYS, Cygwin or WSL drive
 // path to the form native Windows APIs accept.
 //
 // upstream: utils/paths.ts normalizeWindowsShellPath
 func NormalizeWindowsShellPath(filePath string) string {
-	if !strings.HasPrefix(filePath, "/") || strings.HasPrefix(filePath, "//") || strings.Contains(filePath, `\`) {
-		return filePath
-	}
-	match := windowsShellDrivePath.FindStringSubmatch(filePath)
-	if match == nil {
-		return filePath
-	}
-	return strings.ToUpper(match[1]) + `:\` + strings.ReplaceAll(match[2], "/", `\`)
+	return resolvepath.NormalizeWindowsShellPath(filePath)
 }
 
 // resolveToCwd resolves a file path relative to cwd with ~ expansion

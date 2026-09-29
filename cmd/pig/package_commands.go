@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"weak"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/installresolver"
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
@@ -19,6 +22,7 @@ import (
 	sourceref "github.com/MichaelKinsy/PiG/coding/source"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/crossspawn"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 )
 
 type packageCommand string
@@ -31,37 +35,34 @@ const (
 )
 
 type packageCLIOptions struct {
-	command         packageCommand
-	source          string
-	sources         []string
-	local           bool
-	allPackages     bool // pig update --all: self-update plus every configured package
-	extensionsOnly  bool // pig update --extensions: update every package, not pig itself
-	selfOnly        bool
-	extensionSource string
-	force           bool
-	validateOnly    bool
-	jsonOutput      bool
-	help            bool
-	invalidOption   string
-	missingValue    string
-	conflict        string
+	command              packageCommand
+	source               string
+	sources              []string
+	local                bool
+	projectTrustOverride *bool
+	allPackages          bool // pig update --all: self-update plus every configured package
+	extensionsOnly       bool // pig update --extensions: update every package, not pig itself
+	selfOnly             bool
+	modelsOnly           bool
+	extensionSource      string
+	force                bool
+	validateOnly         bool
+	jsonOutput           bool
+	help                 bool
+	invalidOption        string
+	missingValue         string
+	invalidArgument      string
+	conflict             string
+	// showExtensionsSkippedNote marks a bare `pig update`, which updates pig only.
+	showExtensionsSkippedNote bool
 }
 
 type configuredPackage struct {
 	Source        codingagent.PackageSource
-	ProjectDelta  *codingagent.PackageSource
 	Scope         string
 	InstalledPath string
-}
-
-type ProgressCallback func(step string)
-
-func packageScopeName(local bool) string {
-	if local {
-		return "project"
-	}
-	return "global"
+	// ResolvedSource owns the inherited installation when a project delta retains a different metadata source.
+	ResolvedSource string
 }
 
 // isSelfUpdateTarget reports whether an update target names pig itself.
@@ -82,6 +83,9 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 		return nil, false
 	}
 	cmd := args[0]
+	if cmd == "uninstall" {
+		cmd = "remove"
+	}
 	if cmd == "config" {
 		return nil, false
 	}
@@ -89,6 +93,7 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 		return nil, false
 	}
 	opts := &packageCLIOptions{command: packageCommand(cmd)}
+	var positionals []string
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		switch {
@@ -100,6 +105,10 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 			} else if opts.invalidOption == "" {
 				opts.invalidOption = arg
 			}
+		case arg == "--approve" || arg == "-a":
+			opts.projectTrustOverride = new(true)
+		case arg == "--no-approve" || arg == "-na":
+			opts.projectTrustOverride = new(false)
 		case arg == "--validate-only" || arg == "--check":
 			// pig additive (D28): validate-only install mode; see
 			// docs/additive-features.md.
@@ -123,6 +132,12 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 		case arg == "--extensions":
 			if opts.command == packageUpdate {
 				opts.extensionsOnly = true
+			} else if opts.invalidOption == "" {
+				opts.invalidOption = arg
+			}
+		case arg == "--models":
+			if opts.command == packageUpdate {
+				opts.modelsOnly = true
 			} else if opts.invalidOption == "" {
 				opts.invalidOption = arg
 			}
@@ -186,32 +201,68 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 				continue
 			}
 			opts.sources = append(opts.sources, arg)
+			if arg != "" {
+				positionals = append(positionals, arg)
+			}
 		}
 	}
 	opts.sources = compactStrings(opts.sources)
 	if len(opts.sources) > 0 {
 		opts.source = opts.sources[0]
 	}
+	// The first positional is the source and the next one is unexpected.
+	// pig additive (D28): --validate-only installs accept several sources.
+	if len(positionals) > 1 && (opts.command != packageInstall || !opts.validateOnly) {
+		opts.invalidArgument = positionals[1]
+	}
 	if opts.command == packageUpdate {
-		sourceIsSelf := isSelfUpdateTarget(opts.source)
+		// The first conflict found wins: --all, then --models, --extension, and a positional target.
+		conflict := func(message string) {
+			if opts.conflict == "" {
+				opts.conflict = message
+			}
+		}
+		if opts.allPackages && (opts.selfOnly || opts.extensionsOnly || opts.modelsOnly || opts.extensionSource != "") {
+			conflict("--all cannot be combined with --self, --extensions, --models, or --extension")
+		}
+		if opts.allPackages && opts.source != "" {
+			conflict("--all cannot be combined with a positional source")
+		}
 		switch {
-		case opts.allPackages && (opts.selfOnly || opts.extensionsOnly || opts.extensionSource != "" || opts.source != ""):
-			opts.conflict = "--all cannot be combined with --self, --extensions, --extension, or a positional source"
-		case opts.extensionSource != "" && (opts.selfOnly || opts.extensionsOnly || opts.source != ""):
-			opts.conflict = "--extension cannot be combined with --self, --extensions, or a positional source"
-		case opts.source != "" && !sourceIsSelf && (opts.selfOnly || opts.extensionsOnly):
-			opts.conflict = "positional update targets cannot be combined with --self or --extensions"
+		case opts.modelsOnly:
+			if opts.selfOnly || opts.extensionsOnly || opts.allPackages || opts.extensionSource != "" {
+				conflict("--models cannot be combined with --self, --extensions, --all, or --extension")
+			}
+			if opts.source != "" {
+				conflict("--models cannot be combined with a positional source")
+			}
+		case opts.extensionSource != "":
+			if opts.selfOnly || opts.extensionsOnly || opts.allPackages {
+				conflict("--extension cannot be combined with --self, --extensions, or --all")
+			}
+			if opts.source != "" {
+				conflict("--extension cannot be combined with a positional source")
+			}
+			if opts.conflict == "" {
+				opts.source = opts.extensionSource
+			}
+		case opts.source != "":
+			if isSelfUpdateTarget(opts.source) {
+				if opts.extensionsOnly {
+					opts.source = ""
+					opts.allPackages = true
+					opts.extensionsOnly = false
+				}
+			} else if opts.extensionsOnly || opts.selfOnly || opts.allPackages {
+				conflict("positional update targets cannot be combined with --self, --extensions, or --all")
+			}
+		case opts.allPackages:
 		case opts.selfOnly && opts.extensionsOnly:
 			opts.allPackages = true
 			opts.selfOnly = false
 			opts.extensionsOnly = false
-		case sourceIsSelf && opts.extensionsOnly:
-			opts.source = ""
-			opts.allPackages = true
-			opts.extensionsOnly = false
-		}
-		if opts.extensionSource != "" && opts.conflict == "" {
-			opts.source = opts.extensionSource
+		case !opts.selfOnly && !opts.extensionsOnly:
+			opts.showExtensionsSkippedNote = true
 		}
 	}
 	return opts, true
@@ -220,13 +271,13 @@ func parsePackageCommand(args []string) (*packageCLIOptions, bool) {
 func packageUsage(cmd packageCommand) string {
 	switch cmd {
 	case packageInstall:
-		return "pig install <source>... [-l] [--validate-only] [--json] [--set <sources>]"
+		return "pig install <source> [-l] [--approve|--no-approve]"
 	case packageRemove:
-		return "pig remove <source> [-l]"
+		return "pig remove <source> [-l] [--approve|--no-approve]"
 	case packageUpdate:
-		return "pig update [source|self|pig] [--self|--extensions|--all] [--extension <source>] [--force]"
+		return "pig update [source|self|pig] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force]"
 	case packageList:
-		return "pig list"
+		return "pig list [--approve|--no-approve]"
 	default:
 		return "pig <package-command>"
 	}
@@ -235,13 +286,13 @@ func packageUsage(cmd packageCommand) string {
 func printPackageCommandHelp(cmd packageCommand) {
 	switch cmd {
 	case packageInstall:
-		fmt.Print("Usage:\n  pig install <source> [-l]\n  pig install --validate-only [--json] <source>...\n  pig install --validate-only [--json] --set <source[,source...]>\n\nInstall a package and add it to settings. With --validate-only, validate/build/start one or more packages without installing them.\n\nOptions:\n  -l, --local        Install project-locally (.pig/settings.json)\n  --validate-only    Validate/build/start package refs without installing them\n  --json             Emit JSON validation output with --validate-only\n  --set              Validate a comma- or whitespace-separated extension set\n\nExamples:\n  pig install npm:@foo/bar\n  pig install git:github.com/user/repo\n  pig install git:git@github.com:user/repo\n  pig install https://github.com/user/repo\n  pig install ssh://git@github.com/user/repo\n  pig install ./local/path\n  pig install ./local/path --validate-only --json\n  pig install --validate-only --json ./ext-a ./ext-b\n")
+		fmt.Print("Usage:\n  pig install <source> [-l] [--approve|--no-approve]\n  pig install --validate-only [--json] <source>...\n  pig install --validate-only [--json] --set <source[,source...]>\n\nInstall a package and add it to settings. With --validate-only, validate/build/start one or more packages without installing them.\n\nOptions:\n  -l, --local        Install project-locally (.pig/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n  --validate-only    Validate/build/start package refs without installing them\n  --json             Emit JSON validation output with --validate-only\n  --set              Validate a comma- or whitespace-separated extension set\n\nExamples:\n  pig install npm:@foo/bar\n  pig install git:github.com/user/repo\n  pig install git:git@github.com:user/repo\n  pig install https://github.com/user/repo\n  pig install ssh://git@github.com/user/repo\n  pig install ./local/path\n  pig install ./local/path --validate-only --json\n  pig install --validate-only --json ./ext-a ./ext-b\n")
 	case packageRemove:
-		fmt.Print("Usage:\n  pig remove <source> [-l]\n\nRemove a package and its source from settings.\n\nOptions:\n  -l, --local    Remove from project settings (.pig/settings.json)\n\nExamples:\n  pig remove npm:@foo/bar\n")
+		fmt.Print("Usage:\n  pig remove <source> [-l] [--approve|--no-approve]\n\nRemove a package and its source from settings.\nAlias: pig uninstall <source> [-l]\n\nOptions:\n  -l, --local       Remove from project settings (.pig/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  pig remove npm:@foo/bar\n  pig uninstall npm:@foo/bar\n\n")
 	case packageUpdate:
-		fmt.Print("Usage:\n  pig update                         Update pig itself\n  pig update self|pig                Update pig itself\n  pig update <source>                Update one installed package\n  pig update --extension <source>    Update one installed package\n  pig update --extensions            Update every installed package (not pig)\n  pig update --all                   Update packages, then pig\n\nOptions:\n  --self                  Update pig only\n  --extensions            Update installed packages only\n  --all                   Update packages, then pig\n  --extension <source>    Update one installed package only\n  --force                 Reinstall pig even when its version is current\n\nBare `pig update` self-updates the pig binary, mirroring upstream `pi update`.\n")
+		fmt.Print("Usage:\n  " + packageUsage(packageUpdate) + "\n\nUpdate pig, installed packages, or model catalogs.\n\nOptions:\n  --self                  Update pig only (default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update pig and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall pig even if the current version is latest\n\nShort forms:\n  pig update                Update pig only\n  pig update --all          Update pig and all extensions\n  pig update --models       Refresh model catalogs only\n  pig update <source>       Update one package\n  pig update pig            Update pig only (self works as alias to pig)\n\n")
 	case packageList:
-		fmt.Print("Usage:\n  pig list\n\nList installed packages from user and project settings.\n")
+		fmt.Print("Usage:\n  pig list [--approve|--no-approve]\n\nList installed packages from user and project settings.\n\nOptions:\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n")
 	}
 }
 
@@ -251,7 +302,16 @@ func packageContext() (cwd, agentDir string, sm *codingagent.SettingsManager, er
 		return "", "", nil, err
 	}
 	agentDir = codingagent.AgentDir()
-	return cwd, agentDir, codingagent.NewSettingsManager(cwd, agentDir), nil
+	// pig additive (D40): pre-session inspection resolves saved/default trust without invoking extension handlers.
+	sm = codingagent.NewSettingsManagerWithProjectTrust(cwd, agentDir, false)
+	trusted, err := resolveProjectTrusted(context.Background(), projectTrustResolutionOptions{
+		CWD: cwd, Store: codingagent.NewProjectTrustStore(agentDir), Default: sm.GetGlobalSettings().DefaultProjectTrust,
+	})
+	if err != nil {
+		return "", "", nil, err
+	}
+	sm.SetProjectTrusted(trusted)
+	return cwd, agentDir, sm, nil
 }
 
 func reportSettingsErrors(sm *codingagent.SettingsManager, context string) {
@@ -268,43 +328,51 @@ func init() {
 		if scope != "user" && scope != "project" {
 			return "", fmt.Errorf("unknown package materialization scope %q", scope)
 		}
+		sm, err := createPackageCommandSettings(context.Background(), cwd, codingagent.AgentDir(), &packageCLIOptions{command: packageInstall})
+		if err != nil {
+			return "", err
+		}
+		if local && !sm.IsProjectTrusted() {
+			return "", errors.New("Project is not trusted; refusing to access project package storage")
+		}
 		source = strings.TrimSpace(source)
 		kind := detectSourceKind(source)
 		switch kind {
 		case "local":
-			root, err := resolveInputPackageSourceRoot(cwd, source)
+			root, err := resolveInputPackageSourceRoot(cwd, sm, source)
 			if err != nil {
 				return "", err
 			}
 			if _, err := os.Stat(root); err != nil {
-				return "", fmt.Errorf("path does not exist: %s", root)
+				return "", fmt.Errorf("Path does not exist: %s", root)
 			}
 			return root, nil
 		case "npm":
 			_, _ = fmt.Fprintf(stdout, "[%s] fetching %s\n", scope, source)
-			if err := installManagedNPM(cwd, source, local); err != nil {
+			if err := installManagedNPM(cwd, sm, source, local); err != nil {
 				return "", err
 			}
 		case "git":
 			_, _ = fmt.Fprintf(stdout, "[%s] fetching %s\n", scope, source)
-			if err := installManagedGit(cwd, source, local); err != nil {
+			if err := installManagedGit(cwd, sm, source, local); err != nil {
 				return "", err
 			}
 		default:
 			return "", fmt.Errorf("unsupported package source: %s", source)
 		}
-		return sourceRootForResources(cwd, source, local)
+		return sourceRootForResources(cwd, sm, source, local)
 	})
 	installresolver.SetInstaller(func(cwd, source, scope string, stdout, stderr io.Writer) error {
-		sm := codingagent.NewSettingsManager(cwd, codingagent.AgentDir())
+		sm, err := createPackageCommandSettings(context.Background(), cwd, codingagent.AgentDir(), &packageCLIOptions{command: packageInstall})
+		if err != nil {
+			return err
+		}
 		local := scope == "project"
-		return installAndPersistPackage(cwd, sm, source, local, func(step string) {
-			_, _ = fmt.Fprintln(stdout, step)
-		})
+		return installAndPersistPackage(cwd, sm, source, local, packageProgressPrinter(stdout))
 	})
 }
 
-func runPackageCommand(args []string) int {
+func runPackageCommand(args []string, runtimeOptions ...packageCommandRuntimeOptions) int {
 	if len(args) > 0 && args[0] == "package" {
 		return runPackageManagementCommand(args[1:])
 	}
@@ -326,6 +394,11 @@ func runPackageCommand(args []string) int {
 		fmt.Fprintf(os.Stderr, "Usage: %s\n", packageUsage(opts.command))
 		return 1
 	}
+	if opts.invalidArgument != "" {
+		fmt.Fprintf(os.Stderr, "Unexpected argument %s.\n", opts.invalidArgument)
+		fmt.Fprintf(os.Stderr, "Usage: %s\n", packageUsage(opts.command))
+		return 1
+	}
 	if opts.conflict != "" {
 		fmt.Fprintln(os.Stderr, opts.conflict)
 		fmt.Fprintf(os.Stderr, "Usage: %s\n", packageUsage(opts.command))
@@ -341,15 +414,26 @@ func runPackageCommand(args []string) int {
 		fmt.Fprintf(os.Stderr, "Usage: %s\n", packageUsage(opts.command))
 		return 1
 	}
-	if (opts.command == packageRemove || opts.command == packageUpdate) && len(opts.sources) > 1 {
-		fmt.Fprintf(os.Stderr, "%s accepts at most one source.\n", opts.command)
-		fmt.Fprintf(os.Stderr, "Usage: %s\n", packageUsage(opts.command))
-		return 1
+	if opts.command == packageUpdate && opts.modelsOnly {
+		if err := refreshModelCatalogs(codingagent.AgentDir()); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 
-	cwd, _, sm, err := packageContext()
+	cwd, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		printCLIError("%v", err)
+		return 1
+	}
+	sm, err := createPackageCommandSettings(context.Background(), cwd, codingagent.AgentDir(), opts, runtimeOptions...)
+	if err != nil {
+		printCLIError("%v", err)
+		return 1
+	}
+	if opts.local && !sm.IsProjectTrusted() && (opts.command == packageInstall || opts.command == packageRemove) {
+		fmt.Fprintln(os.Stderr, "Project is not trusted. Use --approve to modify local package config.")
 		return 1
 	}
 	reportSettingsErrors(sm, "package command")
@@ -364,20 +448,20 @@ func runPackageCommand(args []string) int {
 		installSources := append([]string(nil), opts.sources...)
 		if opts.validateOnly {
 			// pig additive (D28): emit the validation report instead of installing.
-			return validateInstallSources(cwd, installSources, opts.jsonOutput)
+			return validateInstallSources(cwd, sm, installSources, opts.jsonOutput)
 		}
 		installSource := installSources[0]
-		fmt.Printf("Installing %s...\n", opts.source)
-		if err := installAndPersistPackage(cwd, sm, installSource, opts.local, nil); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if err := installAndPersistPackage(cwd, sm, installSource, opts.local, packageProgressPrinter(os.Stdout)); err != nil {
+			printCLIError("%v", err)
 			return 1
 		}
 		fmt.Printf("Installed %s\n", opts.source)
 		return 0
 	case packageRemove:
+		fmt.Printf("Removing %s...\n", opts.source)
 		removed, err := removeAndPersistPackage(cwd, sm, opts.source, opts.local)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+			printCLIError("%v", err)
 			return 1
 		}
 		if !removed {
@@ -397,9 +481,12 @@ func runPackageCommand(args []string) int {
 // binary (D39); `<source>` updates one package; `--all` refreshes packages and
 // then self-updates, matching upstream's observable operation order.
 func runUpdateCommand(cwd string, sm *codingagent.SettingsManager, opts *packageCLIOptions) int {
+	if opts.showExtensionsSkippedNote {
+		fmt.Printf("Extensions are skipped. Run %s update --extensions to update extensions.\n", codingagent.AppName)
+	}
 	if opts.source != "" && !isSelfUpdateTarget(opts.source) {
-		if err := updatePackages(cwd, sm, opts.source, func(step string) { fmt.Fprintln(os.Stderr, step) }); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if err := updatePackages(cwd, sm, opts.source, packageProgressPrinter(os.Stdout)); err != nil {
+			printCLIError("%v", err)
 			return 1
 		}
 		fmt.Printf("Updated %s\n", opts.source)
@@ -408,8 +495,8 @@ func runUpdateCommand(cwd string, sm *codingagent.SettingsManager, opts *package
 
 	// --extensions updates every package without touching pig itself.
 	if opts.extensionsOnly && !opts.allPackages {
-		if err := updatePackages(cwd, sm, "", func(step string) { fmt.Fprintln(os.Stderr, step) }); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if err := updatePackages(cwd, sm, "", packageProgressPrinter(os.Stdout)); err != nil {
+			printCLIError("%v", err)
 			return 1
 		}
 		fmt.Println("Updated packages")
@@ -419,8 +506,8 @@ func runUpdateCommand(cwd string, sm *codingagent.SettingsManager, opts *package
 	if !opts.allPackages {
 		return runSelfUpdate(opts.force)
 	}
-	if err := updatePackages(cwd, sm, "", func(step string) { fmt.Fprintln(os.Stderr, step) }); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+	if err := updatePackages(cwd, sm, "", packageProgressPrinter(os.Stdout)); err != nil {
+		printCLIError("%v", err)
 		return 1
 	}
 	fmt.Println("Updated packages")
@@ -429,13 +516,13 @@ func runUpdateCommand(cwd string, sm *codingagent.SettingsManager, opts *package
 
 func installAndPersistPackage(cwd string, sm *codingagent.SettingsManager, source string, local bool, progress ProgressCallback) error {
 	pkg := codingagent.PackageSource{Source: source}
-	if err := installPackageArtifacts(cwd, pkg, local, progress); err != nil {
+	if err := installPackageArtifacts(cwd, sm, pkg, local, progress); err != nil {
 		return err
 	}
-	if err := verifyPackageContributesResources(cwd, source, local); err != nil {
+	if err := verifyPackageContributesResources(cwd, sm, source, local); err != nil {
 		return err
 	}
-	if err := addSourceToSettings(cwd, sm, source, local); err != nil {
+	if _, err := addSourceToSettings(cwd, sm, source, local); err != nil {
 		return err
 	}
 	return nil
@@ -443,8 +530,8 @@ func installAndPersistPackage(cwd string, sm *codingagent.SettingsManager, sourc
 
 // pig divergence (D57): reject a proven extension root that Package discovery
 // cannot load.
-func verifyPackageContributesResources(cwd, source string, local bool) error {
-	root := installedPathForSource(cwd, source, local)
+func verifyPackageContributesResources(cwd string, sm *codingagent.SettingsManager, source string, local bool) error {
+	root := installedPathForSource(cwd, sm, source, local)
 	if root == "" {
 		// The source resolved to no local root (a remote form this build cannot
 		// inspect). Nothing to assert against, so stay out of the way.
@@ -466,11 +553,10 @@ func verifyPackageContributesResources(cwd, source string, local bool) error {
 		"package's extensions/ directory", source, source)
 }
 
-// directoryIsProvablyAnExtension accepts only a complete conventional factory
-// or standalone contract. A build marker alone never promotes a Package root.
+// directoryIsProvablyAnExtension accepts a statically proven factory or standalone contract. Node factory resolution only selects an entrypoint; proving its exports requires execution, which Package installation must not perform.
 func directoryIsProvablyAnExtension(root string) bool {
-	_, err := extsource.Resolve(root)
-	return err == nil
+	definition, err := extsource.Resolve(root)
+	return err == nil && (definition.Language != "node" || definition.Form != extsource.Factory)
 }
 
 func packageResourceCount(r packagecontent.Resources) int {
@@ -486,39 +572,31 @@ func getGitDependencyInstallArgs(sm *codingagent.SettingsManager) []string {
 	return []string{"install", "--omit=dev"}
 }
 
+// removeAndPersistPackage runs the removal with the caller's settings before persisting, so failures retain both the package record and command overrides.
 func removeAndPersistPackage(cwd string, sm *codingagent.SettingsManager, source string, local bool) (bool, error) {
-	removed, err := removeSourceFromSettings(cwd, sm, source, local)
-	if err != nil || !removed {
-		return removed, err
-	}
 	if err := removePackageArtifacts(cwd, sm, source, local); err != nil {
 		return false, err
 	}
-	return true, nil
+	return removeSourceFromSettings(cwd, sm, source, local)
 }
 
 func updatePackages(cwd string, sm *codingagent.SettingsManager, source string, progress ProgressCallback) error {
-	pkgs := listConfiguredPackages(cwd, sm)
-	if source != "" {
-		identity := packageIdentityFromInput(cwd, source)
-		for _, pkg := range pkgs {
-			if packageIdentityFromStored(cwd, pkg.Source.Source, pkg.Scope == "project") == identity {
-				local := pkg.Scope == "project"
-				if err := installPackageArtifacts(cwd, pkg.Source, local, progress); err != nil {
-					return err
-				}
-				return nil
-			}
+	// update reads configured sources, not installation paths; pinned entries must not run legacy-root lookups.
+	pkgs := configuredPackageSources(sm)
+	if source == "" {
+		return updateConfiguredSources(cwd, sm, pkgs, progress)
+	}
+	identity := packageIdentityFromInput(cwd, source)
+	var matched []configuredPackage
+	for _, pkg := range pkgs {
+		if packageIdentityFromStored(cwd, pkg.Source.Source, pkg.Scope == "project") == identity {
+			matched = append(matched, pkg)
 		}
+	}
+	if len(matched) == 0 {
 		return errors.New(noMatchingPackageMessage(cwd, source, pkgs))
 	}
-	for _, pkg := range pkgs {
-		local := pkg.Scope == "project"
-		if err := installPackageArtifacts(cwd, pkg.Source, local, progress); err != nil {
-			return err
-		}
-	}
-	return nil
+	return updateConfiguredSources(cwd, sm, matched, progress)
 }
 
 type gitPackageSource struct {
@@ -560,29 +638,30 @@ func normalizePackageSourceForSettings(baseDir, cwd, source string) string {
 	return filepath.Clean(rel)
 }
 
-func addSourceToSettings(cwd string, sm *codingagent.SettingsManager, source string, local bool) error {
-	normalized := normalizePackageSourceForSettings(settingsBaseDirForManager(sm, local), cwd, source)
-	pkg := codingagent.PackageSource{Source: normalized}
+// addSourceToSettings reports whether it adds a source or replaces its ref, retaining filters and avoiding writes for identical sources.
+func addSourceToSettings(cwd string, sm *codingagent.SettingsManager, source string, local bool) (bool, error) {
+	baseDir := settingsBaseDirForManager(sm, local)
+	normalized := normalizePackageSourceForSettings(baseDir, cwd, source)
+	current := sm.GetGlobalSettings().Packages
 	if local {
-		current := append([]codingagent.PackageSource{}, sm.GetProjectSettings().Packages...)
-		baseDir := settingsBaseDirForManager(sm, true)
-		if slices.ContainsFunc(current, func(existing codingagent.PackageSource) bool {
-			return packageMatchKeyForStoredBase(baseDir, existing.Source) == packageMatchKeyForInput(cwd, source)
-		}) {
-			return nil
-		}
-		current = append(current, pkg)
-		return sm.SetProjectPackages(current)
+		current = sm.GetProjectSettings().Packages
 	}
-	current := append([]codingagent.PackageSource{}, sm.GetGlobalSettings().Packages...)
-	baseDir := settingsBaseDirForManager(sm, false)
-	if slices.ContainsFunc(current, func(existing codingagent.PackageSource) bool {
+	current = slices.Clone(current)
+	index := slices.IndexFunc(current, func(existing codingagent.PackageSource) bool {
 		return packageMatchKeyForStoredBase(baseDir, existing.Source) == packageMatchKeyForInput(cwd, source)
-	}) {
-		return nil
+	})
+	if index >= 0 {
+		if current[index].Source == normalized {
+			return false, nil
+		}
+		current[index].Source = normalized
+	} else {
+		current = append(current, codingagent.PackageSource{Source: normalized})
 	}
-	current = append(current, pkg)
-	return sm.SetPackages(current)
+	if local {
+		return true, sm.SetProjectPackages(current)
+	}
+	return true, sm.SetPackages(current)
 }
 
 func removeSourceFromSettings(cwd string, sm *codingagent.SettingsManager, source string, local bool) (bool, error) {
@@ -660,63 +739,59 @@ func listPackages(cwd string, sm *codingagent.SettingsManager) int {
 }
 
 func listConfiguredPackages(cwd string, sm *codingagent.SettingsManager) []configuredPackage {
-	global := sm.GetGlobalSettings().Packages
-	project := sm.GetProjectSettings().Packages
-	packages := make([]configuredPackage, 0, len(global)+len(project))
-	for _, pkg := range global {
-		packages = append(packages, configuredPackage{Source: pkg, Scope: "user", InstalledPath: installedPathForConfiguredSource(cwd, sm, pkg.Source, false)})
-	}
-	for _, pkg := range project {
-		packages = append(packages, configuredPackage{Source: pkg, Scope: "project", InstalledPath: installedPathForConfiguredSource(cwd, sm, pkg.Source, true)})
+	packages := configuredPackageSources(sm)
+	for i := range packages {
+		pkg := &packages[i]
+		pkg.InstalledPath = installedPathForConfiguredSource(cwd, sm, pkg.Source.Source, pkg.Scope == "project")
 	}
 	return packages
 }
 
-func emitProgress(cb ProgressCallback, format string, args ...any) {
-	if cb != nil {
-		cb(fmt.Sprintf(format, args...))
+func configuredPackageSources(sm *codingagent.SettingsManager) []configuredPackage {
+	global := sm.GetGlobalSettings().Packages
+	project := sm.GetProjectSettings().Packages
+	packages := make([]configuredPackage, 0, len(global)+len(project))
+	for _, pkg := range global {
+		packages = append(packages, configuredPackage{Source: pkg, Scope: "user"})
 	}
+	for _, pkg := range project {
+		packages = append(packages, configuredPackage{Source: pkg, Scope: "project"})
+	}
+	return packages
 }
 
-func installPackageArtifacts(cwd string, pkg codingagent.PackageSource, local bool, progress ProgressCallback) error {
-	kind := detectSourceKind(pkg.Source)
-	if kind == "local" {
-		emitProgress(progress, "[%s] validating %s", packageScopeName(local), pkg.Source)
-		root, err := resolveInputPackageSourceRoot(cwd, pkg.Source)
-		if err != nil {
-			return err
-		}
-		if _, err := os.Stat(root); err != nil {
-			return fmt.Errorf("path does not exist: %s", root)
-		}
-		emitProgress(progress, "[%s] ready %s", packageScopeName(local), pkg.Source)
-		return nil
+func installPackageArtifacts(cwd string, sm *codingagent.SettingsManager, pkg codingagent.PackageSource, local bool, progress ProgressCallback) error {
+	if local && !sm.IsProjectTrusted() {
+		return errors.New("Project is not trusted; refusing to access project package storage")
 	}
-	emitProgress(progress, "[%s] fetching %s", packageScopeName(local), pkg.Source)
-	switch kind {
-	case "npm":
-		if err := installManagedNPM(cwd, pkg.Source, local); err != nil {
-			return err
+	return withProgress(progress, "install", pkg.Source, fmt.Sprintf("Installing %s...", pkg.Source), func() error {
+		switch detectSourceKind(pkg.Source) {
+		case "local":
+			root, err := resolveInputPackageSourceRoot(cwd, sm, pkg.Source)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(root); err != nil {
+				return fmt.Errorf("Path does not exist: %s", root)
+			}
+			return nil
+		case "npm":
+			return installManagedNPM(cwd, sm, pkg.Source, local)
+		case "git":
+			return installManagedGit(cwd, sm, pkg.Source, local)
+		default:
+			return fmt.Errorf("unsupported package source: %s", pkg.Source)
 		}
-	case "git":
-		if err := installManagedGit(cwd, pkg.Source, local); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unsupported package source: %s", pkg.Source)
-	}
-	installedPath := installedPathForSource(cwd, pkg.Source, local)
-	if installedPath == "" {
-		return fmt.Errorf("installed package path not found for %s", pkg.Source)
-	}
-	emitProgress(progress, "[%s] installed %s", packageScopeName(local), pkg.Source)
-	return nil
+	})
 }
 
 func removePackageArtifacts(cwd string, sm *codingagent.SettingsManager, source string, local bool) error {
+	if local && !sm.IsProjectTrusted() {
+		return errors.New("Project is not trusted; refusing to access project package storage")
+	}
 	switch detectSourceKind(source) {
 	case "npm":
-		return uninstallManagedNPM(cwd, source, local)
+		return uninstallManagedNPM(cwd, sm, source, local)
 	case "git":
 		checkout, err := gitCheckoutPath(cwd, source, local)
 		if err != nil {
@@ -725,7 +800,13 @@ func removePackageArtifacts(cwd string, sm *codingagent.SettingsManager, source 
 		if configuredGitCheckoutInUse(cwd, sm, source, local) {
 			return nil
 		}
-		return os.RemoveAll(checkout)
+		if err := os.RemoveAll(checkout); err != nil {
+			return err
+		}
+		if err := removeGitUpdateMarker(gitUpdateMarkerPath(checkout)); err != nil {
+			return err
+		}
+		return pruneEmptyGitParents(checkout, codingagent.GitInstallRoot(cwd, sm.AgentDir(), local))
 	default:
 		return nil
 	}
@@ -741,7 +822,7 @@ func configuredGitCheckoutInUse(cwd string, sm *codingagent.SettingsManager, rem
 		wantScope = "project"
 	}
 	for _, pkg := range listConfiguredPackages(cwd, sm) {
-		if pkg.Scope != wantScope {
+		if pkg.Scope != wantScope || packageMatchKeyForStoredBase(settingsBaseDirForManager(sm, local), pkg.Source.Source) == packageMatchKeyForInput(cwd, removedSource) {
 			continue
 		}
 		ref, err := sourceref.Parse(pkg.Source.Source, sourceref.Options{Bare: sourceref.BareReject})
@@ -752,14 +833,14 @@ func configuredGitCheckoutInUse(cwd string, sm *codingagent.SettingsManager, rem
 	return false
 }
 
-func sourceRootForResources(cwd, source string, local bool) (string, error) {
+func sourceRootForResources(cwd string, sm *codingagent.SettingsManager, source string, local bool) (string, error) {
 	switch detectSourceKind(source) {
 	case "npm":
 		ref, err := parseNpmInstallRef(source)
 		if err != nil {
 			return "", err
 		}
-		return npmInstallPath(cwd, ref, local), nil
+		return npmInstallPath(cwd, sm, ref, local), nil
 	case "git":
 		return gitInstallPath(cwd, source, local)
 	case "local":
@@ -770,9 +851,9 @@ func sourceRootForResources(cwd, source string, local bool) (string, error) {
 	}
 }
 
-func resolveInputPackageSourceRoot(cwd, source string) (string, error) {
+func resolveInputPackageSourceRoot(cwd string, sm *codingagent.SettingsManager, source string) (string, error) {
 	if detectSourceKind(source) != "local" {
-		return sourceRootForResources(cwd, source, false)
+		return sourceRootForResources(cwd, sm, source, false)
 	}
 	return resolveLocalPackageRoot(cwd, source)
 }
@@ -783,14 +864,11 @@ func resolveInputLocalPackageRoot(cwd, source string) string {
 }
 
 func resolveLocalPackageRoot(baseDir, source string) (string, error) {
-	if filepath.IsAbs(source) {
-		return filepath.Clean(source), nil
-	}
-	return filepath.Abs(filepath.Join(baseDir, source))
+	return resolvepath.ResolveTrimmed(source, baseDir)
 }
 
-func npmInstallPath(cwd string, ref sourceref.Ref, local bool) string {
-	installRoot := npmInstallRoot(cwd, ref, local)
+func npmInstallPath(cwd string, sm *codingagent.SettingsManager, ref sourceref.Ref, local bool) string {
+	installRoot := npmInstallRoot(cwd, sm, ref, local)
 	managedPath := filepath.Join(installRoot, "node_modules", filepath.FromSlash(ref.NPMName))
 	if local || ref.NPMRegistry != "" {
 		return managedPath
@@ -798,16 +876,16 @@ func npmInstallPath(cwd string, ref sourceref.Ref, local bool) string {
 	if _, err := os.Stat(managedPath); err == nil {
 		return managedPath
 	}
-	if pnpmPath := getPnpmGlobalPackagePath(cwd, ref.NPMName); pnpmPath != "" {
-		if _, err := os.Stat(pnpmPath); err == nil {
-			return pnpmPath
+	if legacyPath := getLegacyGlobalNpmInstallPath(sm, ref.NPMName); legacyPath != "" {
+		if _, err := os.Stat(legacyPath); err == nil {
+			return legacyPath
 		}
 	}
 	return managedPath
 }
 
-func npmInstallRoot(cwd string, ref sourceref.Ref, local bool) string {
-	root := codingagent.NPMInstallRoot(cwd, codingagent.AgentDir(), local)
+func npmInstallRoot(cwd string, sm *codingagent.SettingsManager, ref sourceref.Ref, local bool) string {
+	root := codingagent.NPMInstallRoot(cwd, sm.AgentDir(), local)
 	if ref.NPMRegistry == "" {
 		return root
 	}
@@ -815,50 +893,116 @@ func npmInstallRoot(cwd string, ref sourceref.Ref, local bool) string {
 	return filepath.Join(root, "registries", fmt.Sprintf("%x", digest[:8]))
 }
 
-func getPnpmGlobalPackagePath(cwd, packageName string) string {
-	npmCommand := defaultNpmCommand(cwd)
-	packageManagerName := npmCommandName(npmCommand)
-	if packageManagerName != "pnpm" {
+// getLegacyGlobalNpmInstallPath follows Pi's pnpm lookup, then its global-root fallback.
+func getLegacyGlobalNpmInstallPath(sm *codingagent.SettingsManager, packageName string) string {
+	if resolved, err := getPnpmGlobalPackagePath(sm, packageName); err != nil {
 		return ""
+	} else if resolved != "" {
+		return resolved
+	}
+	root, err := getGlobalNpmRoot(sm)
+	if err != nil || root == "" {
+		return ""
+	}
+	return filepath.Join(root, filepath.FromSlash(packageName))
+}
+
+// globalNpmRoot is Pi's DefaultPackageManager globalNpmRoot and globalNpmRootCommandKey. Pi keeps that cache on each DefaultPackageManager, and creates fresh managers (with empty caches) around the same SettingsManager, for example for every interactive package-update check (interactive-mode.ts:1202-1206). Pig threads the SettingsManager itself through package resolution, so each SettingsManager owns one entry until it is collected; a later lookup with an unchanged command reuses the root where Pi would run it again. The mutex also holds concurrent lookups while the first runs the command, as Pi's synchronous spawn does.
+type globalNpmRoot struct {
+	mu         sync.Mutex
+	commandKey string
+	root       string
+}
+
+var globalNpmRoots struct {
+	mu      sync.Mutex
+	entries map[weak.Pointer[codingagent.SettingsManager]]*globalNpmRoot
+}
+
+func globalNpmRootFor(sm *codingagent.SettingsManager) *globalNpmRoot {
+	key := weak.Make(sm)
+	globalNpmRoots.mu.Lock()
+	defer globalNpmRoots.mu.Unlock()
+	if entry := globalNpmRoots.entries[key]; entry != nil {
+		return entry
+	}
+	if globalNpmRoots.entries == nil {
+		globalNpmRoots.entries = make(map[weak.Pointer[codingagent.SettingsManager]]*globalNpmRoot)
+	}
+	entry := &globalNpmRoot{}
+	globalNpmRoots.entries[key] = entry
+	runtime.AddCleanup(sm, func(key weak.Pointer[codingagent.SettingsManager]) {
+		globalNpmRoots.mu.Lock()
+		delete(globalNpmRoots.entries, key)
+		globalNpmRoots.mu.Unlock()
+	}, key)
+	return entry
+}
+
+// getGlobalNpmRoot is Pi's getGlobalNpmRoot: the selected command's global root, reused until the npmCommand argv changes. An empty root is not reused, and a failed lookup keeps the previous entry.
+func getGlobalNpmRoot(sm *codingagent.SettingsManager) (string, error) {
+	command := defaultNpmCommand(sm)
+	commandKey := strings.Join(command, "\x00")
+	entry := globalNpmRootFor(sm)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.root != "" && entry.commandKey == commandKey {
+		return entry.root, nil
+	}
+	var root string
+	if npmCommandName(command) == "bun" {
+		binDir, err := runCmd(command[0], append(command[1:], "pm", "bin", "-g")...)
+		if err != nil || binDir == "" {
+			return "", err
+		}
+		root = filepath.Join(filepath.Dir(binDir), "install", "global", "node_modules")
+	} else {
+		var err error
+		if root, err = runCmd(command[0], append(command[1:], "root", "-g")...); err != nil {
+			return "", err
+		}
+	}
+	entry.commandKey, entry.root = commandKey, root
+	return root, nil
+}
+
+func getPnpmGlobalPackagePath(sm *codingagent.SettingsManager, packageName string) (string, error) {
+	npmCommand := defaultNpmCommand(sm)
+	if npmCommandName(npmCommand) != "pnpm" {
+		return "", nil
 	}
 	output, err := runCmd(npmCommand[0], append(npmCommand[1:], "list", "-g", "--depth", "0", "--json")...)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	var entries []struct {
 		Dependencies map[string]struct {
 			Path string `json:"path"`
 		} `json:"dependencies"`
 	}
-	if err := json.Unmarshal([]byte(output), &entries); err == nil {
-		for _, entry := range entries {
-			if dep, ok := entry.Dependencies[packageName]; ok && dep.Path != "" {
-				return dep.Path
-			}
+	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+		return "", err
+	}
+	if entries == nil {
+		return "", errors.New("invalid pnpm global package list")
+	}
+	for _, entry := range entries {
+		if dep, ok := entry.Dependencies[packageName]; ok && dep.Path != "" {
+			return dep.Path, nil
 		}
 	}
-	var single struct {
-		Dependencies map[string]struct {
-			Path string `json:"path"`
-		} `json:"dependencies"`
-	}
-	if err := json.Unmarshal([]byte(output), &single); err != nil {
-		return ""
-	}
-	if dep, ok := single.Dependencies[packageName]; ok {
-		return dep.Path
-	}
-	return ""
+	return "", nil
 }
 
-func defaultNpmCommand(cwd string) []string {
-	sm := codingagent.NewSettingsManager(cwd, codingagent.AgentDir())
+// defaultNpmCommand uses the caller's resolved trust and overrides; helper calls must not reload project settings.
+func defaultNpmCommand(sm *codingagent.SettingsManager) []string {
 	if cmd := sm.GetNpmCommand(); len(cmd) > 0 {
 		return append([]string(nil), cmd...)
 	}
 	return []string{"npm"}
 }
 
+// npmCommandName uses the executable after the last --, preserves case, and removes only .cmd/.exe suffixes without spawning the command (Pi package-manager.ts:1760-1764).
 func npmCommandName(cmd []string) string {
 	if len(cmd) == 0 {
 		return ""
@@ -870,24 +1014,25 @@ func npmCommandName(cmd []string) string {
 		}
 	}
 	target := cmd[0]
-	if idx >= 0 && idx+1 < len(cmd) {
+	if idx >= 0 {
+		if idx+1 == len(cmd) {
+			return ""
+		}
 		target = cmd[idx+1]
 	}
-	base := filepath.Base(target)
-	base = strings.TrimSuffix(base, filepath.Ext(base))
-	name := strings.ToLower(base)
-	if name == "npm" && len(cmd) == 1 {
-		if out, err := runCmd(target, "--version"); err == nil {
-			if strings.Contains(strings.ToLower(out), "pnpm") {
-				return "pnpm"
-			}
-		}
+	if target == "" {
+		return ""
 	}
-	return name
+	base := filepath.Base(target)
+	ext := filepath.Ext(base)
+	if strings.EqualFold(ext, ".cmd") || strings.EqualFold(ext, ".exe") {
+		return strings.TrimSuffix(base, ext)
+	}
+	return base
 }
 
-func installedPathForSource(cwd, source string, local bool) string {
-	path, err := sourceRootForResources(cwd, source, local)
+func installedPathForSource(cwd string, sm *codingagent.SettingsManager, source string, local bool) string {
+	path, err := sourceRootForResources(cwd, sm, source, local)
 	if err == nil {
 		if _, statErr := os.Stat(path); statErr == nil {
 			return path
@@ -920,9 +1065,7 @@ func packageIdentityFromStored(cwd, source string, local bool) string {
 	return packageSourceIdentity(settingsBaseDirForScope(cwd, local), source)
 }
 
-// packageSourceIdentity centralizes upstream package identity and Pig contributed
-// scheme identity. Identity matching follows upstream parseSource: an unprefixed
-// value is local; bare-name-as-npm is only an install-boundary convenience.
+// packageSourceIdentity centralizes upstream package identity and Pig contributed scheme identity. Identity matching follows upstream parseSource: an unprefixed value is local.
 //
 // pig additive (D18): registered contributed source schemes participate in
 // the same deterministic identity contract as upstream npm/git/local sources.
@@ -999,32 +1142,31 @@ func parseGitPackageSource(source string) (gitPackageSource, bool) {
 	}, true
 }
 
-func installManagedNPM(cwd, source string, local bool) error {
+func installManagedNPM(cwd string, sm *codingagent.SettingsManager, source string, local bool) error {
 	ref, err := parseNpmInstallRef(source)
 	if err != nil {
 		return err
 	}
-	installRoot := npmInstallRoot(cwd, ref, local)
+	installRoot := npmInstallRoot(cwd, sm, ref, local)
 	if err := ensureManagedPackageRoot(installRoot); err != nil {
 		return err
 	}
-	command := defaultNpmCommand(cwd)
+	command := defaultNpmCommand(sm)
 	args := append([]string{}, command[1:]...)
 	args = append(args, npmInstallArgs(npmCommandName(command), ref.Locator, installRoot, ref.NPMRegistry)...)
-	_, err = runCmd(command[0], args...)
-	return err
+	return runPackageProcess("", command[0], args...)
 }
 
-func uninstallManagedNPM(cwd, source string, local bool) error {
+func uninstallManagedNPM(cwd string, sm *codingagent.SettingsManager, source string, local bool) error {
 	ref, err := parseNpmInstallRef(source)
 	if err != nil {
 		return err
 	}
-	installRoot := npmInstallRoot(cwd, ref, local)
+	installRoot := npmInstallRoot(cwd, sm, ref, local)
 	if _, err := os.Stat(installRoot); os.IsNotExist(err) {
 		return nil
 	}
-	command := defaultNpmCommand(cwd)
+	command := defaultNpmCommand(sm)
 	args := append([]string{}, command[1:]...)
 	if npmCommandName(command) == "bun" {
 		args = append(args, "uninstall", ref.NPMName, "--cwd", installRoot)
@@ -1037,8 +1179,7 @@ func uninstallManagedNPM(cwd, source string, local bool) error {
 	if ref.NPMRegistry != "" {
 		args = append(args, "--registry", ref.NPMRegistry)
 	}
-	_, err = runCmd(command[0], args...)
-	return err
+	return runPackageProcess("", command[0], args...)
 }
 
 func npmInstallArgs(manager, spec, installRoot, registry string) []string {
@@ -1082,7 +1223,7 @@ func ensureManagedPackageRoot(root string) error {
 	return nil
 }
 
-func installManagedGit(cwd, source string, local bool) error {
+func installManagedGit(cwd string, sm *codingagent.SettingsManager, source string, local bool) (err error) {
 	ref, err := sourceref.Parse(source, sourceref.Options{Bare: sourceref.BareReject})
 	if err != nil || ref.Kind != sourceref.KindGit {
 		return fmt.Errorf("invalid Git package source: %s", source)
@@ -1091,36 +1232,58 @@ func installManagedGit(cwd, source string, local bool) error {
 	if err != nil {
 		return err
 	}
-	root := codingagent.GitInstallRoot(cwd, codingagent.AgentDir(), local)
-	if err := ensureManagedCheckoutRoot(root); err != nil {
-		return err
-	}
-	if _, err := os.Stat(checkout); os.IsNotExist(err) {
-		repo := ref.GitRepo
-		if !strings.Contains(repo, "://") && !strings.HasPrefix(repo, "git@") {
-			repo = "https://" + repo
-		}
-		if _, err := runCmd("git", "clone", gitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	} else if ref.GitRef == "" {
-		if _, err := runCmd("git", "-C", checkout, "pull", "--ff-only"); err != nil {
-			return err
-		}
-	}
-	if ref.GitRef != "" {
-		if _, err := runCmd("git", "-C", checkout, "fetch", "origin", ref.GitRef); err != nil {
-			return err
-		}
-		if _, err := runCmd("git", "-C", checkout, "checkout", "FETCH_HEAD"); err != nil {
-			return err
-		}
-	}
+	root := codingagent.GitInstallRoot(cwd, sm.AgentDir(), local)
 	packageRoot, err := gitInstallPath(cwd, source, local)
 	if err != nil {
 		return err
+	}
+	return installGitCheckout(sm, ref, checkout, packageRoot, root)
+}
+
+// installGitCheckout shares update, dependency repair, and failed-clone cleanup between installed and temporary sources. An empty root leaves temporary-cache parents intact, as Pi does.
+func installGitCheckout(sm *codingagent.SettingsManager, ref sourceref.Ref, checkout, packageRoot, root string) (err error) {
+	if _, statErr := os.Stat(checkout); statErr == nil {
+		if err := requireGitSubdirectoryWithinCheckout(checkout, packageRoot); err != nil {
+			return err
+		}
+		target := gitUpdateTarget{ref: "FETCH_HEAD", fetchArgs: []string{"fetch", "origin", ref.GitRef}}
+		if ref.GitRef == "" {
+			target, err = getLocalGitUpdateTarget(checkout)
+			if err != nil {
+				return err
+			}
+		}
+		return ensureGitRef(checkout, packageRoot, sm, target)
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if root != "" {
+		if err := ensureManagedCheckoutRoot(root); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(checkout), 0o755); err != nil {
+		return err
+	}
+	if err := removeGitUpdateMarker(gitUpdateMarkerPath(checkout)); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, os.RemoveAll(checkout), pruneEmptyGitParents(checkout, root))
+		}
+	}()
+	repo := ref.GitRepo
+	if !strings.Contains(repo, "://") && !strings.HasPrefix(repo, "git@") {
+		repo = "https://" + repo
+	}
+	if err := runPackageProcess("", "git", "clone", gitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
+		return err
+	}
+	if ref.GitRef != "" {
+		if err := runPackageProcess(checkout, "git", "checkout", ref.GitRef); err != nil {
+			return err
+		}
 	}
 	info, err := os.Stat(packageRoot)
 	if err != nil {
@@ -1132,15 +1295,7 @@ func installManagedGit(cwd, source string, local bool) error {
 	if err := requireGitSubdirectoryWithinCheckout(checkout, packageRoot); err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(packageRoot, "package.json")); err == nil {
-		command := defaultNpmCommand(cwd)
-		args := append([]string{}, command[1:]...)
-		args = append(args, getGitDependencyInstallArgs(codingagent.NewSettingsManager(cwd, codingagent.AgentDir()))...)
-		if _, err := runCmdInDir(packageRoot, command[0], args...); err != nil {
-			return err
-		}
-	}
-	return nil
+	return installGitDependencies(packageRoot, sm)
 }
 
 func gitCheckoutPath(cwd, source string, local bool) (string, error) {
@@ -1174,11 +1329,15 @@ func gitCheckoutRelative(goos, root string, ref sourceref.Ref) (string, error) {
 			}
 		}
 	}
-	relative := filepath.Clean(filepath.Join(segments...))
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-		return "", fmt.Errorf("invalid Git package path: %s", ref.GitPath)
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
 	}
-	return relative, nil
+	resolved, err := resolveManagedPackagePath(absoluteRoot, segments...)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Rel(absoluteRoot, resolved)
 }
 
 // gitCloneRepo is the URL git clones for repo. Git for Windows reads
@@ -1246,20 +1405,10 @@ func ensureManagedCheckoutRoot(root string) error {
 }
 
 func detectSourceKind(source string) string {
-	// Package install preserves upstream's bare-name-as-npm behavior, while an
-	// existing bare filesystem entry remains local. Explicit contributed schemes
-	// are accepted only when a resolver has claimed them.
-	ref, err := sourceref.Parse(source, sourceref.Options{Bare: sourceref.BareNPM, AllowContributed: true})
+	// Pi package-manager.ts:1446-1470 treats unprefixed sources as local, whether or not the path exists.
+	ref, err := sourceref.Parse(source, sourceref.Options{Bare: sourceref.BareLocal, AllowContributed: true})
 	if err != nil {
 		return "unsupported"
-	}
-	if ref.Kind == sourceref.KindNPM {
-		if _, statErr := os.Stat(strings.TrimSpace(source)); statErr == nil {
-			ref, err = sourceref.Parse(source, sourceref.Options{Bare: sourceref.BareLocal})
-			if err != nil {
-				return "unsupported"
-			}
-		}
 	}
 	switch ref.Kind {
 	case sourceref.KindNPM:
@@ -1280,15 +1429,21 @@ func runCmd(name string, args ...string) (string, error) {
 	return runCmdInDir("", name, args...)
 }
 
-// runCmdInDir runs a package-manager or git command as upstream's
-// spawnProcess does, so a Windows .cmd shim such as npm.cmd receives its
-// arguments exactly.
+// runCmdInDir is Pi's runCommandSync. It starts the command as upstream's spawnProcess does, so a Windows .cmd shim such as npm.cmd receives its arguments exactly, and returns the trimmed stdout, or stderr when stdout is empty, so a warning on stderr cannot corrupt a reported path.
 func runCmdInDir(dir, name string, args ...string) (string, error) {
-	cmd := crossspawn.Command(context.Background(), name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	cmd := crossspawn.Command(context.Background(), dir, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		detail := stderr.String()
+		if detail == "" {
+			detail = stdout.String()
+		}
+		return "", fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(detail))
 	}
-	return strings.TrimSpace(string(out)), nil
+	output := stdout.String()
+	if output == "" {
+		output = stderr.String()
+	}
+	return strings.TrimSpace(output), nil
 }

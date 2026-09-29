@@ -105,6 +105,20 @@ func (c SlashCommandCatalog) SubprocessCommands() []subprocess.CommandInfo {
 	return out
 }
 
+// WithSkillSources projects loaded skills with the same resource provenance used by command discovery. Inline skills retain their authored metadata; file-backed skills use resolver and extension-discovery metadata.
+// Ports packages/coding-agent/src/core/resource-loader.ts
+func (c SlashCommandCatalog) WithSkillSources(skills []*SkillDef) []*SkillDef {
+	out := make([]*SkillDef, 0, len(skills))
+	for _, skill := range skills {
+		copy := *skill
+		if skill.Path != "" && skill.SourceInfo.Source != "inline" {
+			copy.SourceInfo = c.SourceInfoForPath(skill.Path, "skills")
+		}
+		out = append(out, &copy)
+	}
+	return out
+}
+
 // SourceInfoForPath returns the SourceInfo of a resource of kind
 // ("extensions", "prompts" or "skills") loaded from path.
 func (c SlashCommandCatalog) SourceInfoForPath(path, kind string) PiSourceInfo {
@@ -148,7 +162,7 @@ func (c SlashCommandCatalog) SourceInfoForPath(path, kind string) PiSourceInfo {
 		info.BaseDir = filepath.Dir(path)
 	}
 	userRoot := filepath.Join(c.AgentDir, kind)
-	projectRoot := filepath.Join(c.CWD, CONFIG_DIR_NAME, kind)
+	projectRoot := filepath.Join(ProjectConfigDir(c.CWD), kind)
 	switch {
 	case resourcePathWithin(path, userRoot):
 		info.Scope, info.BaseDir = "user", userRoot

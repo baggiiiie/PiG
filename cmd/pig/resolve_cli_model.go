@@ -8,7 +8,6 @@ package main
 
 import (
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -32,22 +31,8 @@ type ResolveCliModelResult struct {
 	Error         string
 }
 
-// ParsedModelResult mirrors upstream ParsedModelResult.
-type ParsedModelResult struct {
-	Model         *codingagent.RuntimeModel
-	ThinkingLevel string
-	Warning       string
-}
-
-var modelDateSuffix = regexp.MustCompile(`-\d{8}$`)
-
-// isAlias reports whether a model id has no date suffix.
-func isAlias(id string) bool {
-	if strings.HasSuffix(id, "-latest") {
-		return true
-	}
-	return !modelDateSuffix.MatchString(id)
-}
+// ParsedModelResult is the shared model-pattern result used by startup and interactive selection.
+type ParsedModelResult = codingagent.ParsedModelResult
 
 func modelRef(model codingagent.RuntimeModel) string { return model.Provider + "/" + model.ID }
 
@@ -55,120 +40,9 @@ func modelsAreEqual(a, b codingagent.RuntimeModel) bool {
 	return a.Provider == b.Provider && a.ID == b.ID
 }
 
-// FindExactModelReferenceMatch mirrors upstream findExactModelReferenceMatch.
-func FindExactModelReferenceMatch(modelReference string, availableModels []codingagent.RuntimeModel) *codingagent.RuntimeModel {
-	trimmed := strings.TrimSpace(modelReference)
-	if trimmed == "" {
-		return nil
-	}
-	normalized := strings.ToLower(trimmed)
-	var canonical []codingagent.RuntimeModel
-	for _, model := range availableModels {
-		if strings.ToLower(modelRef(model)) == normalized {
-			canonical = append(canonical, model)
-		}
-	}
-	if len(canonical) == 1 {
-		return &canonical[0]
-	}
-	if len(canonical) > 1 {
-		return nil
-	}
-	if provider, modelID, ok := strings.Cut(trimmed, "/"); ok {
-		provider, modelID = strings.TrimSpace(provider), strings.TrimSpace(modelID)
-		if provider != "" && modelID != "" {
-			var matches []codingagent.RuntimeModel
-			for _, model := range availableModels {
-				if strings.EqualFold(model.Provider, provider) && strings.EqualFold(model.ID, modelID) {
-					matches = append(matches, model)
-				}
-			}
-			if len(matches) == 1 {
-				return &matches[0]
-			}
-			if len(matches) > 1 {
-				return nil
-			}
-		}
-	}
-	var idMatches []codingagent.RuntimeModel
-	for _, model := range availableModels {
-		if strings.ToLower(model.ID) == normalized {
-			idMatches = append(idMatches, model)
-		}
-	}
-	if len(idMatches) == 1 {
-		return &idMatches[0]
-	}
-	return nil
-}
-
-// tryMatchModel mirrors upstream tryMatchModel: an exact reference, otherwise
-// the highest-sorting alias (or dated version) whose id or name contains the
-// pattern.
-func tryMatchModel(pattern string, availableModels []codingagent.RuntimeModel) *codingagent.RuntimeModel {
-	if exact := FindExactModelReferenceMatch(pattern, availableModels); exact != nil {
-		return exact
-	}
-	lower := strings.ToLower(pattern)
-	var aliases, dated []codingagent.RuntimeModel
-	for _, model := range availableModels {
-		if !strings.Contains(strings.ToLower(model.ID), lower) && !strings.Contains(strings.ToLower(model.Name), lower) {
-			continue
-		}
-		if isAlias(model.ID) {
-			aliases = append(aliases, model)
-		} else {
-			dated = append(dated, model)
-		}
-	}
-	candidates := aliases
-	if len(candidates) == 0 {
-		candidates = dated
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	// Upstream sorts with String.prototype.localeCompare, descending.
-	collator := collate.New(language.Und)
-	slices.SortStableFunc(candidates, func(a, b codingagent.RuntimeModel) int {
-		return collator.CompareString(b.ID, a.ID)
-	})
-	return &candidates[0]
-}
-
-// ParseModelPattern mirrors upstream parseModelPattern.
+// ParseModelPattern resolves CLI patterns with the same parser as interactive scopes.
 func ParseModelPattern(pattern string, availableModels []codingagent.RuntimeModel, allowInvalidThinkingLevelFallback bool) ParsedModelResult {
-	if exact := tryMatchModel(pattern, availableModels); exact != nil {
-		return ParsedModelResult{Model: exact}
-	}
-	lastColon := strings.LastIndex(pattern, ":")
-	if lastColon == -1 {
-		return ParsedModelResult{}
-	}
-	prefix, suffix := pattern[:lastColon], pattern[lastColon+1:]
-	if validThinkingLevels[suffix] {
-		result := ParseModelPattern(prefix, availableModels, allowInvalidThinkingLevelFallback)
-		if result.Model != nil {
-			if result.Warning == "" {
-				result.ThinkingLevel = suffix
-			} else {
-				result.ThinkingLevel = ""
-			}
-		}
-		return result
-	}
-	if !allowInvalidThinkingLevelFallback {
-		return ParsedModelResult{}
-	}
-	result := ParseModelPattern(prefix, availableModels, allowInvalidThinkingLevelFallback)
-	if result.Model != nil {
-		return ParsedModelResult{
-			Model:   result.Model,
-			Warning: fmt.Sprintf(`Invalid thinking level "%s" in pattern "%s". Using default instead.`, suffix, pattern),
-		}
-	}
-	return result
+	return codingagent.ParseModelPattern(pattern, availableModels, allowInvalidThinkingLevelFallback)
 }
 
 // buildFallbackModel mirrors upstream buildFallbackModel: the provider's
@@ -365,6 +239,13 @@ func resolveFallbackModel(provider, pattern, cliThinking, warning string, availa
 	model := buildFallbackModel(provider, fallbackPattern, availableModels)
 	if model == nil {
 		return ResolveCliModelResult{}, false
+	}
+	requestedThinking := cliThinking
+	if requestedThinking == "" {
+		requestedThinking = fallbackThinking
+	}
+	if requestedThinking != "" && requestedThinking != "off" {
+		model.Reasoning = true
 	}
 	message := fmt.Sprintf(`Model "%s" not found for provider "%s". Using custom model id.`, fallbackPattern, provider)
 	if warning != "" {

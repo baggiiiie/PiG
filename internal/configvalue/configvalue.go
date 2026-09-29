@@ -267,7 +267,7 @@ func ResolveOrError(s, description string, env map[string]string) (string, error
 	if isCommand(s) {
 		v, ok := executeUncached(s)
 		if !ok {
-			return "", fmt.Errorf("failed to resolve %s from shell command: %s", description, strings.TrimPrefix(s, "!"))
+			return "", fmt.Errorf("Failed to resolve %s from shell command: %s", description, strings.TrimPrefix(s, "!"))
 		}
 		return v, nil
 	}
@@ -278,11 +278,11 @@ func ResolveOrError(s, description string, env map[string]string) (string, error
 	missing := GetMissingConfigValueEnvVarNames(s, env)
 	switch len(missing) {
 	case 1:
-		return "", fmt.Errorf("failed to resolve %s from environment variable: %s", description, missing[0])
+		return "", fmt.Errorf("Failed to resolve %s from environment variable: %s", description, missing[0])
 	case 0:
-		return "", fmt.Errorf("failed to resolve %s", description)
+		return "", fmt.Errorf("Failed to resolve %s", description)
 	default:
-		return "", fmt.Errorf("failed to resolve %s from environment variables: %s", description, strings.Join(missing, ", "))
+		return "", fmt.Errorf("Failed to resolve %s from environment variables: %s", description, strings.Join(missing, ", "))
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 
 // ─── Canned responses for compaction / branch summarization ──────────────────
 // These must be identical in ai/test_faux.go (pig) and
-// parity/testdata/test-faux-provider.ts (upstream pi).
+// test/parity/testdata/test-faux-provider.ts (upstream pi).
 
 const testFauxSummaryResponse = `## Goal
 The user explored Go programming language features and error handling patterns.
@@ -94,7 +94,7 @@ The user asked a complex question requiring multi-step analysis.
 //
 // Any other value returns an EventError.
 // Test-faux model limits match the model the upstream side of the parity
-// harness registers (parity/testdata/test-faux-provider.ts), so both sides
+// harness registers (test/parity/testdata/test-faux-provider.ts), so both sides
 // report the same context window and output budget.
 const (
 	TestFauxContextWindow = 128000
@@ -185,7 +185,7 @@ func (p *TestFauxProvider) Stream(ctx context.Context, transcript TranscriptCont
 				strings.Contains(historyText(messages), "Trigger: overflow error with queued message")
 		// TEST_FAUX_HOLD_COMPACTION holds a /compact summary until the run is
 		// cancelled, so a probe of the in-progress screen captures a steady
-		// state instead of racing a fixed delay. parity/testdata/
+		// state instead of racing a fixed delay. test/parity/testdata/
 		// test-faux-provider.ts does the same for Pi.
 		if os.Getenv("TEST_FAUX_HOLD_COMPACTION") == "1" &&
 			strings.Contains(lastText, "Create a structured context checkpoint summary") {
@@ -220,6 +220,8 @@ func (p *TestFauxProvider) Stream(ctx context.Context, transcript TranscriptCont
 				builder.toolCallDelta(streamToolCallDelta{
 					index: index, id: fmt.Sprintf("call_test_faux_%d", firstID+uint64(index)), name: call.Name, argumentsDelta: string(arguments),
 				})
+				// The paired Pi fixture completes each call before emitting the next call's start.
+				builder.endToolCall(index)
 			}
 			builder.done(StopReasonToolUse, nil, "")
 		case "error":
@@ -365,6 +367,18 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		}}
 	}
 
+	if strings.Contains(lastText, "Run: extension argument coercion") {
+		return "tool", "", []testFauxToolCall{{Name: "coercion_probe", Args: map[string]any{
+			"native": map[string]any{"integer": "2.9", "flag": "TRUE", "array": "3", "optional": nil},
+			"plain":  map[string]any{"integer": "2", "flag": "true", "optional": nil},
+		}}}
+	}
+	if strings.Contains(lastText, "Run: noncanonical read") {
+		return "tool", "", []testFauxToolCall{{Name: "read", Args: map[string]any{
+			"path": "parity-read-target.txt", "offset": "2", "limit": nil, "extra": true,
+		}}}
+	}
+
 	// Read tool parity.
 	if strings.Contains(lastText, "Run: read parity-read-target.txt") {
 		return "tool", "", []testFauxToolCall{{
@@ -494,14 +508,17 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		}}
 	}
 
-	// Find tool parity.
-	if strings.Contains(lastText, "Run: find txt files") {
+	// Find results are echoed, not replaced with a success token: a failed search must fail the scenario.
+	if strings.Contains(lastText, "Run: find txt files") || strings.Contains(lastText, "Run: find path glob") || strings.Contains(lastText, "Run: find scoped ignores") {
+		pattern := "*.txt"
+		if strings.Contains(lastText, "Run: find path glob") {
+			pattern = "src/**/*.spec.ts"
+		} else if strings.Contains(lastText, "Run: find scoped ignores") {
+			pattern = "**/*.txt"
+		}
 		return "tool", "", []testFauxToolCall{{
 			Name: "find",
-			Args: map[string]any{
-				"pattern": "*.txt",
-				"path":    ".",
-			},
+			Args: map[string]any{"pattern": pattern, "path": "."},
 		}}
 	}
 
@@ -552,6 +569,13 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 	if _, ok := last.(ToolResultMessage); ok {
 		if strings.Contains(currentUserText, "Run: expr 20 + 22") {
 			return "text", "42", nil
+		}
+		if strings.Contains(currentUserText, "Run: noncanonical read") || strings.Contains(currentUserText, "Run: extension argument coercion") {
+			result := last.(ToolResultMessage)
+			if result.IsError {
+				return "error", lastText, nil
+			}
+			return "text", lastText, nil
 		}
 		if strings.Contains(currentUserText, "Run: read parity-read-target.txt") {
 			return "text", "done", nil
@@ -607,8 +631,11 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		if strings.Contains(currentUserText, "Run: grep hello") {
 			return "text", "found", nil
 		}
-		if strings.Contains(currentUserText, "Run: find txt files") {
-			return "text", "listed", nil
+		if strings.Contains(currentUserText, "Run: find txt files") || strings.Contains(currentUserText, "Run: find path glob") || strings.Contains(currentUserText, "Run: find scoped ignores") {
+			// fd traversal order is unspecified; upstream's find regression tests sort the paths too.
+			paths := strings.Split(lastText, "\n")
+			slices.Sort(paths)
+			return "text", strings.Join(paths, "\n"), nil
 		}
 		if strings.Contains(currentUserText, "Run: ls here") {
 			return "text", "listed-ls", nil
@@ -635,7 +662,7 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 			return "text", "sanitized", nil
 		}
 		if strings.Contains(currentUserText, "Run: bash with invalid args") {
-			return "text", "validation-handled", nil
+			return "text", lastText, nil
 		}
 	}
 
@@ -667,11 +694,11 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 	}
 
 	// Validation parity: trigger a tool call whose args fail schema validation.
-	// The bash tool requires "command" (string); sending a number should fail.
+	// Arrays cannot be coerced to a command string; numbers can.
 	if strings.Contains(lastText, "Run: bash with invalid args") {
 		return "tool", "", []testFauxToolCall{{
 			Name: "bash",
-			Args: map[string]any{"command": 42},
+			Args: map[string]any{"command": []any{}},
 		}}
 	}
 

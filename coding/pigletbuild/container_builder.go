@@ -538,7 +538,7 @@ func containerUserArgs() ([]string, error) {
 // numeric uid does not have. That is the normal case for the environments a
 // container build targets, so the kernel's own view of the ids is the fallback.
 func containerUserArgsFor(goos string, lookup func() (*user.User, error), getuid, getgid func() int) ([]string, error) {
-	// pig divergence (D67): a Windows host maps no uid:gid into the build container.
+	// pig additive (D67): a Windows host maps no uid:gid into the build container.
 	if goos == "windows" {
 		return nil, nil
 	}

@@ -166,10 +166,10 @@ func marshalAssistantEvent(eventType AssistantEventType, event any) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return nil, err
+	// The discriminator precedes the variant fields, as in Pi's event object literals.
+	prefix := []byte(fmt.Sprintf(`{"type":%q`, eventType))
+	if len(body) > 2 {
+		prefix = append(prefix, ',')
 	}
-	fields["type"] = json.RawMessage(fmt.Sprintf("%q", eventType))
-	return json.Marshal(fields)
+	return append(prefix, body[1:]...), nil
 }

@@ -1,20 +1,16 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
-	"github.com/MichaelKinsy/PiG/internal/crossspawn"
 )
 
 // Network timeout for update checks. Mirrors upstream NETWORK_TIMEOUT_MS
@@ -28,8 +24,8 @@ const updateCheckConcurrency = 5
 // PI_OFFLINE) env var is set to a truthy value. Mirrors upstream
 // isOfflineModeEnabled (package-manager.ts:29).
 func IsOfflineModeEnabled() bool {
-	if strings.TrimSpace(os.Getenv("PI_OFFLINE")) != "" {
-		return true
+	if value := os.Getenv("PI_OFFLINE"); value != "" {
+		return value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
 	}
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("PIG_OFFLINE")))
 	return v == "1" || v == "true" || v == "yes"
@@ -44,75 +40,82 @@ type PackageUpdate struct {
 	Scope       string // "user" or "project"
 }
 
-// CheckForAvailableUpdates queries npm registry and git remotes for
-// available updates to installed packages. Mirrors upstream
-// DefaultPackageManager.checkForAvailableUpdates (package-manager.ts:1114).
-// Returns empty slice when offline mode is enabled.
+// CheckForAvailableUpdates queries npm registry and git remotes for updates to installed, unpinned packages with at most five joined workers. It returns a non-nil slice, including when offline or no updates are available.
+// Mirrors upstream DefaultPackageManager.checkForAvailableUpdates (packages/coding-agent/src/core/package-manager.ts:1186-1253).
+// User-package metadata uses managed storage (D79); trusted project packages use cwd.
 func CheckForAvailableUpdates(cwd string, sm *codingagent.SettingsManager) []PackageUpdate {
 	if IsOfflineModeEnabled() {
-		return nil
+		return []PackageUpdate{}
 	}
 	pkgs := configuredPackagesForResolution(cwd, sm)
 	if len(pkgs) == 0 {
-		return nil
+		return []PackageUpdate{}
 	}
 
 	type result struct {
 		update *PackageUpdate
 	}
 
-	sem := make(chan struct{}, updateCheckConcurrency)
 	results := make([]result, len(pkgs))
-	var wg sync.WaitGroup
+	check := func(idx int) {
+		p := pkgs[idx]
 
-	for i, pkg := range pkgs {
-		wg.Add(1)
-		go func(idx int, p configuredPackage) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			source := p.Source.Source
-			installed := p.InstalledPath
-			if installed == "" {
+		source := p.Source.Source
+		installed := p.InstalledPath
+		if installed == "" {
+			return
+		}
+		kind := detectSourceKind(source)
+		// Exact npm versions are fixed; tags and ranges remain eligible for metadata lookup.
+		if kind == "npm" && isPinnedNpm(source) {
+			return
+		}
+		switch kind {
+		case "npm":
+			ref, err := parseNpmInstallRef(source)
+			if err != nil {
 				return
 			}
-			kind := detectSourceKind(source)
-			// Skip pinned versions (any explicit @suffix). Mirrors upstream
-			// parseSource + checkForAvailableUpdates.
-			if kind == "npm" && isPinnedNpm(source) {
+			if npmHasAvailableUpdate(cwd, sm, ref, installed, p.Scope == "project") {
+				results[idx] = result{update: &PackageUpdate{
+					Source:      source,
+					DisplayName: ref.NPMName,
+					Type:        "npm",
+					Scope:       p.Scope,
+				}}
+			}
+		case "git":
+			ref, ok := parseGitPackageSource(source)
+			if !ok || ref.pinned {
 				return
 			}
-			switch kind {
-			case "npm":
-				name, _ := parseNpmSpec(strings.TrimSpace(strings.TrimPrefix(source, "npm:")))
-				if name == "" {
-					return
-				}
-				if npmHasAvailableUpdate(installed, name) {
-					results[idx] = result{update: &PackageUpdate{
-						Source:      source,
-						DisplayName: name,
-						Type:        "npm",
-						Scope:       p.Scope,
-					}}
-				}
-			case "git":
-				url := strings.TrimPrefix(source, "git:")
-				if gitHasAvailableUpdate(installed) {
-					results[idx] = result{update: &PackageUpdate{
-						Source:      source,
-						DisplayName: gitDisplayName(url),
-						Type:        "git",
-						Scope:       p.Scope,
-					}}
-				}
+			if gitHasAvailableUpdate(installed) {
+				results[idx] = result{update: &PackageUpdate{
+					Source:      source,
+					DisplayName: ref.host + "/" + ref.path,
+					Type:        "git",
+					Scope:       p.Scope,
+				}}
 			}
-		}(i, pkg)
+		}
 	}
+	// upstream: packages/coding-agent/src/core/package-manager.ts:runWithConcurrency
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range min(updateCheckConcurrency, len(pkgs)) {
+		wg.Go(func() {
+			for idx := range jobs {
+				check(idx)
+			}
+		})
+	}
+	for idx := range pkgs {
+		jobs <- idx
+	}
+	close(jobs)
 	wg.Wait()
 
-	var updates []PackageUpdate
+	updates := []PackageUpdate{}
 	for _, r := range results {
 		if r.update != nil {
 			updates = append(updates, *r.update)
@@ -121,11 +124,13 @@ func CheckForAvailableUpdates(cwd string, sm *codingagent.SettingsManager) []Pac
 	return updates
 }
 
-// isPinnedNpm returns true for any npm source with an explicit version suffix.
-// Mirrors upstream parseSource: any `npm:name@something` sets pinned=true.
+// isPinnedNpm reports whether a source specifies an exact semantic version, rather than a mutable tag or range.
 func isPinnedNpm(source string) bool {
-	_, version := parseNpmSpec(strings.TrimPrefix(source, "npm:"))
-	return version != ""
+	ref, err := parseNpmInstallRef(source)
+	if err != nil {
+		return false
+	}
+	return isExactNpmVersion(ref.NPMVer)
 }
 
 // parseNpmSpec splits "@scope/name@1.2.3" into ("@scope/name", "1.2.3").
@@ -138,131 +143,95 @@ func parseNpmSpec(spec string) (name, version string) {
 	return m[1], m[2]
 }
 
-// npmHasAvailableUpdate compares the installed package.json version
-// against `npm view <name> version`. Returns true if the latest
-// published version differs from the installed version.
-func npmHasAvailableUpdate(installedPath, packageName string) bool {
-	installedVer := readInstalledNpmVersion(installedPath)
-	if installedVer == "" {
+// gitHasAvailableUpdate compares local HEAD against remote HEAD via
+// `git ls-remote`. Mirrors upstream gitHasAvailableUpdate.
+func gitHasAvailableUpdate(installedPath string) bool {
+	if IsOfflineModeEnabled() {
 		return false
 	}
-	latest := fetchLatestNpmVersion(packageName)
-	if latest == "" {
-		return false
-	}
-	return installedVer != latest
-}
-
-func readInstalledNpmVersion(installedPath string) string {
-	data, err := os.ReadFile(filepath.Join(installedPath, "package.json"))
+	localCmd := exec.Command("git", "rev-parse", "HEAD")
+	localCmd.Dir = installedPath
+	localHead, err := runWithTimeout(localCmd, updateCheckNetworkTimeout)
 	if err != nil {
-		return ""
+		return false
 	}
-	var pkg struct {
-		Version string `json:"version"`
-	}
-	if err := json.Unmarshal(data, &pkg); err != nil {
-		return ""
-	}
-	return pkg.Version
+	remoteHead, err := getRemoteGitHead(installedPath)
+	return err == nil && strings.TrimSpace(localHead) != strings.TrimSpace(remoteHead)
 }
 
-func fetchLatestNpmVersion(packageName string) string {
-	cmd := crossspawn.Command(context.Background(), "npm", "view", packageName, "version", "--json")
-	cmd.Env = append(os.Environ(), "NPM_CONFIG_FUND=false", "NPM_CONFIG_AUDIT=false")
+func getRemoteGitHead(installedPath string) (string, error) {
+	if upstreamRef := getGitUpstreamRef(installedPath); upstreamRef != "" {
+		out, err := runGitRemoteCommand(installedPath, "ls-remote", "origin", upstreamRef)
+		if err != nil {
+			return "", err
+		}
+		if match := regexp.MustCompile(`(?m)^([0-9a-f]{40})\s+`).FindStringSubmatch(out); len(match) > 1 {
+			return match[1], nil
+		}
+	}
+	out, err := runGitRemoteCommand(installedPath, "ls-remote", "origin", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if match := regexp.MustCompile(`(?m)^([0-9a-f]{40})\s+HEAD$`).FindStringSubmatch(out); len(match) > 1 {
+		return match[1], nil
+	}
+	return "", fmt.Errorf("Failed to determine remote HEAD")
+}
+
+func getGitUpstreamRef(installedPath string) string {
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "@{upstream}")
+	cmd.Dir = installedPath
 	out, err := runWithTimeout(cmd, updateCheckNetworkTimeout)
 	if err != nil {
 		return ""
 	}
-	raw := strings.TrimSpace(out)
-	if raw == "" {
+	branch, ok := strings.CutPrefix(strings.TrimSpace(out), "origin/")
+	if !ok || branch == "" {
 		return ""
 	}
-	var version string
-	if err := json.Unmarshal([]byte(raw), &version); err != nil {
-		return ""
-	}
-	return version
+	return "refs/heads/" + branch
 }
 
-// gitHasAvailableUpdate compares local HEAD against remote HEAD via
-// `git ls-remote`. Mirrors upstream gitHasAvailableUpdate.
-func gitHasAvailableUpdate(installedPath string) bool {
-	localCmd := exec.Command("git", "rev-parse", "HEAD")
-	localCmd.Dir = installedPath
-	localOut, err := runWithTimeout(localCmd, updateCheckNetworkTimeout)
-	if err != nil {
-		return false
-	}
-	localHead := strings.TrimSpace(localOut)
-
-	// Try upstream ref first; fall back to HEAD.
-	upstreamCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "@{upstream}")
-	upstreamCmd.Dir = installedPath
-	upstreamOut, _ := runWithTimeout(upstreamCmd, updateCheckNetworkTimeout)
-	upstreamRef := strings.TrimSpace(upstreamOut)
-
-	var remoteHead string
-	if upstreamRef != "" {
-		remoteCmd := exec.Command("git", "ls-remote", "origin", upstreamRef)
-		remoteCmd.Dir = installedPath
-		out, err := runWithTimeout(remoteCmd, updateCheckNetworkTimeout)
-		if err == nil {
-			if m := regexp.MustCompile(`(?m)^([0-9a-f]{40})\s+`).FindStringSubmatch(out); len(m) > 1 {
-				remoteHead = m[1]
-			}
-		}
-	}
-	if remoteHead == "" {
-		remoteCmd := exec.Command("git", "ls-remote", "origin", "HEAD")
-		remoteCmd.Dir = installedPath
-		out, err := runWithTimeout(remoteCmd, updateCheckNetworkTimeout)
-		if err != nil {
-			return false
-		}
-		if m := regexp.MustCompile(`(?m)^([0-9a-f]{40})\s+HEAD$`).FindStringSubmatch(out); len(m) > 1 {
-			remoteHead = m[1]
-		}
-	}
-	if remoteHead == "" {
-		return false
-	}
-	return localHead != remoteHead
+// runGitRemoteCommand disables interactive credential prompts only for this remote query.
+func runGitRemoteCommand(installedPath string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = installedPath
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	return runWithTimeout(cmd, updateCheckNetworkTimeout)
 }
 
-// gitDisplayName turns a git URL into "org/repo".
-func gitDisplayName(url string) string {
-	clean := strings.TrimSuffix(url, ".git")
-	if idx := strings.LastIndex(clean, "://"); idx >= 0 {
-		clean = clean[idx+3:]
-	}
-	// Drop "host/" prefix if present.
-	parts := strings.SplitN(clean, "/", 2)
-	if len(parts) == 2 {
-		return parts[1]
-	}
-	return clean
-}
-
-// runWithTimeout runs a command and returns stdout, killing the process
-// if it exceeds the timeout.
+// runWithTimeout captures a command and waits for child/output cleanup before returning, including after a timeout.
+// Mirrors packages/coding-agent/src/core/package-manager.ts:runCommandCapture.
 func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) (string, error) {
-	type result struct {
-		out string
-		err error
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		return "", err
 	}
-	ch := make(chan result, 1)
-	go func() {
-		out, err := cmd.Output()
-		ch <- result{string(out), err}
-	}()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var err error
 	select {
-	case r := <-ch:
-		return r.out, r.err
-	case <-time.After(timeout):
-		_ = cmd.Process.Kill()
-		return "", errors.New("command timeout")
+	case err = <-done:
+	case <-timer.C:
+		terminatePackageCapture(cmd.Process)
+		<-done
+		return "", fmt.Errorf("%s timed out after %dms", strings.Join(cmd.Args, " "), timeout.Milliseconds())
 	}
+	if err != nil {
+		if cmd.ProcessState == nil {
+			return "", err
+		}
+		diagnostic := stderr.String()
+		if diagnostic == "" {
+			diagnostic = stdout.String()
+		}
+		return "", fmt.Errorf("%s failed with %s: %s", strings.Join(cmd.Args, " "), packageCaptureExitStatus(cmd.ProcessState), diagnostic)
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // FormatPackageUpdates formats a list of available updates for display.
@@ -281,26 +250,22 @@ func FormatPackageUpdates(updates []PackageUpdate) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// EnsureConfiguredPackagesInstalled reinstalls any configured packages
-// whose install directory is missing on disk. Mirrors upstream's
-// onMissing callback flow in DefaultPackageManager.resolve
-// (package-manager.ts:839). Skipped in offline mode.
+// EnsureConfiguredPackagesInstalled reinstalls missing installations and npm packages whose local manifest does not satisfy the configured version or range. Offline mode reports these sources as missing without installing them.
 //
-// Returns the list of source strings that were reinstalled, and a list
-// of source strings that could not be reinstalled (e.g. network error,
-// offline mode).
+// Returns the source strings that were reinstalled and the sources that remain unavailable because installation failed or offline mode prevented it.
+// upstream: packages/coding-agent/src/core/package-manager.ts:resolvePackageSources
 func EnsureConfiguredPackagesInstalled(cwd string, sm *codingagent.SettingsManager) (reinstalled, missing []string) {
 	packages := configuredPackagesForResolution(cwd, sm)
 	if IsOfflineModeEnabled() {
 		for _, pkg := range packages {
-			if pkg.InstalledPath == "" {
+			if configuredPackageNeedsInstall(pkg) {
 				missing = append(missing, pkg.Source.Source)
 			}
 		}
 		return nil, missing
 	}
 	for _, pkg := range packages {
-		if pkg.InstalledPath != "" {
+		if !configuredPackageNeedsInstall(pkg) {
 			continue
 		}
 		local := pkg.Scope == "project"
@@ -313,11 +278,28 @@ func EnsureConfiguredPackagesInstalled(cwd string, sm *codingagent.SettingsManag
 			}
 			source.Source = resolved
 		}
-		if err := installPackageArtifacts(cwd, source, local, nil); err != nil {
+		if err := installPackageArtifacts(cwd, sm, source, local, nil); err != nil {
 			missing = append(missing, pkg.Source.Source)
 			continue
 		}
 		reinstalled = append(reinstalled, pkg.Source.Source)
 	}
 	return reinstalled, missing
+}
+
+func configuredPackageNeedsInstall(pkg configuredPackage) bool {
+	return pkg.InstalledPath == "" || !installedPackageMatchesConfiguredVersion(pkg)
+}
+
+// installedPackageMatchesConfiguredVersion checks configured and temporary npm packages with the same local manifest rule. Inherited deltas use the source that owns their installation.
+func installedPackageMatchesConfiguredVersion(pkg configuredPackage) bool {
+	sourceText := pkg.ResolvedSource
+	if sourceText == "" {
+		sourceText = pkg.Source.Source
+	}
+	if detectSourceKind(sourceText) != "npm" {
+		return true
+	}
+	source, err := parseNpmInstallRef(sourceText)
+	return err == nil && installedNpmMatchesConfiguredVersion(source, pkg.InstalledPath)
 }

@@ -69,6 +69,12 @@ func resolveAppMode(mode string, print, stdinIsTTY, stdoutIsTTY bool) appMode {
 	}
 }
 
+// isPlainRuntimeMetadataCommand preserves stdout only for metadata without explicit mode/print options.
+// Ports packages/coding-agent/src/main.ts:129-130.
+func isPlainRuntimeMetadataCommand(flags CLIFlags) bool {
+	return flags.Print == "" && !flags.modeSet && (flags.Help || flags.ListModelsAll || flags.ListModels != "")
+}
+
 // processAppMode resolves the app mode for this process's flags and standard
 // streams.
 func processAppMode(flags CLIFlags) appMode {
@@ -121,6 +127,7 @@ func newSubprocessExtensionHost(cwd string, mode extension.ExtensionMode, regist
 	host.Builder().SetStagedSDKVerifier(pigsdk.VerifyStaged(codingagent.ConfigRoot()))
 	if registry != nil {
 		host.SetProviderCallbacks(registry.RegisterProvider, registry.UnregisterProvider)
+		host.SetNativeProviderCallback(registry.RegisterNativeProvider)
 	}
 	// Log crashes to stderr. Suppress during shutdown to avoid
 	// "connection closed" noise when extensions are torn down.

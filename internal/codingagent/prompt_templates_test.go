@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/tui"
 )
 
 // file-based prompt templates.
@@ -378,6 +380,7 @@ func TestInteractivePromptLoadingUsesPreResolvedPathsOnly(t *testing.T) {
 }
 
 func TestPromptDiagnosticsReachInteractiveReload(t *testing.T) {
+	isolateDisplayHome(t)
 	m, _ := newExtensionDialogProbe(t)
 	path := filepath.Join(t.TempDir(), "broken.md")
 	if err := os.WriteFile(path, []byte("---\ndescription: [unterminated\n---\nBody"), 0o600); err != nil {
@@ -388,8 +391,9 @@ func TestPromptDiagnosticsReachInteractiveReload(t *testing.T) {
 	if len(m.promptDiagnostics) != 1 || m.promptDiagnostics[0].Type != "warning" || m.promptDiagnostics[0].Path != path {
 		t.Fatalf("diagnostics = %#v", m.promptDiagnostics)
 	}
-	m.showPromptDiagnostics()
-	output := stripANSITest(strings.Join(m.chatContainer.Render(300), "\n"))
+	m.loadedResourcesContainer = tui.NewContainer()
+	m.showLoadedResources(false, true)
+	output := stripANSITest(strings.Join(m.loadedResourcesContainer.Render(300), "\n"))
 	if !strings.Contains(output, "[Prompt conflicts]") || !strings.Contains(output, path) || !strings.Contains(output, m.promptDiagnostics[0].Message) {
 		t.Fatalf("warning missing: %q", output)
 	}

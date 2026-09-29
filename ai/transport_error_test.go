@@ -102,8 +102,9 @@ func TestProviderHTTPErrorStatusIsNotTransportFailure(t *testing.T) {
 	defer server.Close()
 
 	result := transportErrorTestResult(t, transportErrorTestProvider(server.URL))
-	if result.StopReason != StopReasonError || !strings.Contains(result.ErrorMessage, "HTTP 400") {
-		t.Fatalf("result = reason %q error %q, want HTTP 400", result.StopReason, result.ErrorMessage)
+	// Pi's OpenAI SDK message is normalized with the parsed error object, not a Go HTTP prefix.
+	if result.StopReason != StopReasonError || result.ErrorMessage != `400: {"message":"invalid request"}` {
+		t.Fatalf("result = reason %q error %q, want normalized provider error 400", result.StopReason, result.ErrorMessage)
 	}
 	if strings.Contains(result.ErrorMessage, "fetch failed") || strings.Contains(result.ErrorMessage, "terminated") {
 		t.Fatalf("HTTP status was mislabeled as a transport failure: %q", result.ErrorMessage)
@@ -185,7 +186,7 @@ func TestBedrockMidStreamTransportFailureMatchesTerminated(t *testing.T) {
 	streamErr := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
 	builder := newAssistantStreamBuilder(context.Background(), APIBedrockConverseStream, "amazon-bedrock", "test-model")
 	provider := &BedrockProvider{}
-	go provider.parseBedrockEvents(context.Background(), &fakeBedrockEventStream{events: events, err: streamErr}, builder)
+	go provider.parseBedrockEvents(context.Background(), &fakeBedrockEventStream{events: events, err: streamErr}, builder, "")
 
 	result := builder.stream.Result()
 	assertRetryableTransportResult(t, result, "terminated")

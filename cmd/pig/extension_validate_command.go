@@ -131,7 +131,7 @@ type extensionValidationPlacementCell struct {
 	Status     string   `json:"status"`
 }
 
-func validateInstallSources(cwd string, sources []string, jsonOut bool) int {
+func validateInstallSources(cwd string, sm *codingagent.SettingsManager, sources []string, jsonOut bool) int {
 	sources = compactStrings(sources)
 	if len(sources) == 0 {
 		return printValidationError("missing install source", jsonOut)
@@ -142,7 +142,7 @@ func validateInstallSources(cwd string, sources []string, jsonOut bool) int {
 	reports := make([]extensionValidationReport, 0, len(sources))
 	valid := true
 	for _, source := range sources {
-		sourceReports, err := validateResolvedInstallSources(cwd, source)
+		sourceReports, err := validateResolvedInstallSources(cwd, sm, source)
 		if err != nil {
 			valid = false
 			reports = append(reports, validationErrorReport(source, err))
@@ -157,7 +157,7 @@ func validateInstallSources(cwd string, sources []string, jsonOut bool) int {
 				data, _ := json.MarshalIndent(report, "", "  ")
 				_, _ = fmt.Fprintln(os.Stdout, string(data))
 			} else {
-				fmt.Fprintln(os.Stderr, "error:", report.Error)
+				printCLIError("%s", report.Error)
 			}
 			return 1
 		}
@@ -199,8 +199,8 @@ func validateInstallSources(cwd string, sources []string, jsonOut bool) int {
 	return 0
 }
 
-func validateResolvedInstallSources(cwd, source string) ([]extensionValidationReport, error) {
-	root, err := resolveInputPackageSourceRoot(cwd, source)
+func validateResolvedInstallSources(cwd string, sm *codingagent.SettingsManager, source string) ([]extensionValidationReport, error) {
+	root, err := resolveInputPackageSourceRoot(cwd, sm, source)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +223,7 @@ func printValidationError(message string, jsonOut bool) int {
 		data, _ := json.MarshalIndent(map[string]any{"valid": false, "error": message}, "", "  ")
 		_, _ = fmt.Fprintln(os.Stdout, string(data))
 	} else {
-		fmt.Fprintln(os.Stderr, "error:", message)
+		printCLIError("%s", message)
 	}
 	return 1
 }
