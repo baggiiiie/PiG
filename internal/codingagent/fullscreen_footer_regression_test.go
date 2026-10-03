@@ -1,11 +1,14 @@
 package codingagent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"testing/synctest"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
@@ -63,5 +66,49 @@ func TestFullscreenShowsExtensionStatusBelowEditor(t *testing.T) {
 	editor, status := strings.Index(rows, widthx.CursorMarker), strings.Index(rows, "extension-status-visible")
 	if editor < 0 || status <= editor {
 		t.Fatalf("extension status missing below fullscreen editor: %q", rows)
+	}
+}
+
+// Pi renders dialogs on its event loop; fullscreen resize must queue UI work (#121).
+func TestFullscreenResizeQueuesDialogLayoutOnOwnerLoop(t *testing.T) {
+	for _, state := range []string{"open", "closed-before-dispatch", "shutdown-before-dispatch"} {
+		t.Run(state, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				m := newFullscreenProbe(t)
+				ctx, cancel := context.WithCancel(m.runCtx)
+				t.Cleanup(cancel)
+				m.runCtx = ctx
+				for range 60 {
+					m.chatContainer.Add(tui.NewText("line"))
+				}
+				m.extensionDialog = &extensionDialog{component: tui.NewText("dialog")}
+				m.chatContainer.SetMaxLines(5)
+				m.altScreen.SetFixedSize(80, 31)
+				m.altScreen.Render()
+				synctest.Wait()
+				if got := len(m.chatContainer.Render(80)); got != 5 {
+					t.Fatalf("resize changed the transcript off the owner loop: %d lines, want 5", got)
+				}
+				want := 27 // 31 terminal rows minus one dialog row and three chrome rows.
+				switch state {
+				case "closed-before-dispatch":
+					m.extensionDialog = nil
+					m.chatContainer.SetMaxLines(0)
+					want = 60
+				case "shutdown-before-dispatch":
+					cancel()
+					want = 5
+				}
+				select {
+				case task := <-m.uiTaskCh:
+					task()
+				default:
+					t.Fatal("resize did not queue dialog layout on the owner loop")
+				}
+				if got := len(m.chatContainer.Render(80)); got != want {
+					t.Fatalf("owner-loop transcript = %d lines, want %d", got, want)
+				}
+			})
+		})
 	}
 }

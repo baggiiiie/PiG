@@ -42,17 +42,20 @@ func (m *InteractiveMode) setExtensionDialogViewMode(on bool, dialogLines int) {
 	m.tuiInst.Render()
 }
 
-// onTerminalHeightChange keeps height-dependent state current across a resize.
-// The extension-dialog chat cap is derived from terminal height, so without
-// this a resize while a dialog is open leaves the previous height's cap in
-// place.
+// onTerminalHeightChange notifies extensions off the render loop and queues dialog layout on the owner loop.
 func (m *InteractiveMode) onTerminalHeightChange(height int) {
 	if m.opts.SubprocessHost != nil {
 		m.opts.SubprocessHost.NotifyHeight(height)
 	}
-	if m.extensionDialog != nil {
-		m.setExtensionDialogViewMode(true, m.extensionDialogLines(m.extensionDialog.component))
-	}
+	ctx := m.runCtx
+	m.runOnMain(ctx, func() {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if m.extensionDialog != nil {
+			m.setExtensionDialogViewMode(true, m.extensionDialogLines(m.extensionDialog.component))
+		}
+	})
 }
 
 // extensionDialogLines measures a dialog component at the current width so the

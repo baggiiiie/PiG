@@ -369,6 +369,12 @@ func TestExtensionDialogCapIsRecomputedOnHeightChange(t *testing.T) {
 	// Stand in for a resize having moved the cap off its correct value.
 	m.chatContainer.SetMaxLines(staleChatCap)
 	m.onTerminalHeightChange(m.tuiInst.Height())
+	select {
+	case task := <-m.uiTaskCh:
+		task()
+	default:
+		t.Fatal("height change did not post to the UI loop")
+	}
 
 	if got := len(m.chatContainer.Render(100)); got != want {
 		t.Fatalf("height change left the cap at %d; want it recomputed to %d", got, want)
@@ -386,6 +392,12 @@ func TestHeightChangesReachTheDialogCapWithoutSubprocessExtensions(t *testing.T)
 	m.chatContainer.SetMaxLines(staleChatCap)
 	m.extensionDialog = &extensionDialog{component: tui.NewText("dialog")}
 	m.onTerminalHeightChange(m.tuiInst.Height())
+	select {
+	case task := <-m.uiTaskCh:
+		task()
+	default:
+		t.Fatal("height change did not post to the UI loop")
+	}
 	if got := len(m.chatContainer.Render(100)); got == staleChatCap {
 		t.Fatal("height change did not recompute the cap without a subprocess host")
 	}
